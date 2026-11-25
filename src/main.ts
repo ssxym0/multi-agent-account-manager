@@ -2052,7 +2052,7 @@ function renderMiddleContent(state: ManagerSnapshot, provider: ProviderInfo): st
                 </div>
                 ${showManualAliasHint ? `<div class="alias-manual-hint"><span>未获取到邮箱</span><button class="inline-rename-link" data-rename-uuid="${escapeHtml(acc.uuid)}" type="button">手动改名</button></div>` : ""}
                 ${compactSubHtml}
-                ${!hasDetail && !isLoggedOut && !hasPageError && !switching && cookieInfo ? `<div class="cookie-expiry-line inline ${cookieInfo.tone}" title="${escapeHtml(cookieInfo.tooltip)}"><span class="cookie-expiry-dot"></span><span>${escapeHtml(cookieInfo.shortText)}</span></div>` : ""}
+                ${!hasDetail && !isLoggedOut && !hasPageError && !switching && cookieInfo ? `<div class="cookie-expiry-line inline ${cookieInfo.tone}" title="${escapeHtml(cookieInfo.tooltip)}"><span class="cookie-expiry-dot"></span><span>${escapeHtml(cookieInfo.shortText)}</span>${acc.alias ? `<span class="cookie-acct-name" title="${escapeHtml(acc.alias)}">${escapeHtml(acc.alias)}</span>` : ""}</div>` : ""}
               </div>
               <div class="row-ops">
                 ${canReorder ? `
@@ -2074,7 +2074,7 @@ function renderMiddleContent(state: ManagerSnapshot, provider: ProviderInfo): st
               </div>
             </div>
             ${!isLoggedOut && !hasPageError && acc.quotaDetail ? renderQuotaDetailPanel(acc.quotaDetail, alertStatus, extraDepleted) : ""}
-            ${hasDetail && cookieInfo ? `<div class="cookie-expiry-line ${cookieInfo.tone}" title="${escapeHtml(cookieInfo.tooltip)}"><span class="cookie-expiry-dot"></span><span>${escapeHtml(cookieInfo.shortText)}</span></div>` : ""}
+            ${hasDetail && cookieInfo ? `<div class="cookie-expiry-line ${cookieInfo.tone}" title="${escapeHtml(cookieInfo.tooltip)}"><span class="cookie-expiry-dot"></span><span>${escapeHtml(cookieInfo.shortText)}</span>${acc.alias ? `<span class="cookie-acct-name" title="${escapeHtml(acc.alias)}">${escapeHtml(acc.alias)}</span>` : ""}</div>` : ""}
           </div>
         `;
       })

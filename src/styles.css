@@ -2365,6 +2365,17 @@ body,
   font-size: 10.5px;
 }
 
+.cookie-acct-name {
+  margin-left: auto;
+  padding-left: 8px;
+  max-width: 58%;
+  font-weight: 600;
+  color: var(--text-main);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .cookie-expiry-dot {
   width: 6px;
   height: 6px;
