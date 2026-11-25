@@ -1956,8 +1956,20 @@ function renderMiddleContent(state: ManagerSnapshot, provider: ProviderInfo): st
           supportsProxy && acc.proxyUrl
             ? `<span class="proxy-pill" title="代理：${escapeHtml(acc.proxyUrl)}">代理</span>`
             : "";
+        const tzShortMap: Record<string, string> = {
+          "America/New_York": "NY",
+          "America/Los_Angeles": "LA",
+          "Europe/London": "EU",
+          "Asia/Tokyo": "JP",
+          "Asia/Singapore": "SG",
+          "Asia/Shanghai": "SH",
+          UTC: "UTC",
+        };
+        const tzShort = acc.timezone
+          ? (tzShortMap[acc.timezone] ?? acc.timezone.split("/").pop()!.replace(/_/g, " "))
+          : "";
         const timezoneBadgeHtml = acc.timezone
-          ? `<span class="proxy-pill" title="时区：${escapeHtml(acc.timezone)}">${escapeHtml(acc.timezone)}</span>`
+          ? `<span class="proxy-pill" title="时区：${escapeHtml(acc.timezone)}">${escapeHtml(tzShort)}</span>`
           : "";
         const alertBadgeHtml = switching
           ? `<span class="loading-status-badge">加载中…</span>`
