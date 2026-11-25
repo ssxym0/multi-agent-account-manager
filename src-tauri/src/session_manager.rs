@@ -3703,6 +3703,32 @@ fn build_group_sync_latest_js(adapter: &SiteAdapterConfig, raw_user_content: &st
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+/// 把被内嵌页拦截的站外链接交给系统浏览器打开；同一链接 3 秒内只打开一次，
+/// 避免重定向链或重复触发刷出一堆浏览器标签页。
+fn open_external_link_once(raw_url: &str) {
+  if !(raw_url.starts_with("https://") || raw_url.starts_with("http://")) {
+    return;
+  }
+  static LAST_OPEN: std::sync::Mutex<Option<(String, std::time::Instant)>> =
+    std::sync::Mutex::new(None);
+  {
+    let mut guard = match LAST_OPEN.lock() {
+      Ok(g) => g,
+      Err(poisoned) => poisoned.into_inner(),
+    };
+    if let Some((last_url, last_at)) = guard.as_ref() {
+      if last_url == raw_url && last_at.elapsed() < std::time::Duration::from_secs(3) {
+        return;
+      }
+    }
+    *guard = Some((raw_url.to_string(), std::time::Instant::now()));
+  }
+  #[cfg(desktop)]
+  {
+    let _ = platform::open_external_browser(raw_url);
+  }
+}
+
 pub struct AccountPageError {
   pub provider_id: ProviderId,
   pub uuid: String,
@@ -6539,7 +6565,10 @@ impl SessionManager {
           });
           false
         }
-        NavigationDecision::Deny => false,
+        NavigationDecision::Deny => {
+          open_external_link_once(url.as_str());
+          false
+        }
       }
     })
     .on_new_window(move |url, features| {
@@ -6562,6 +6591,7 @@ impl SessionManager {
           return tauri::webview::NewWindowResponse::Deny;
         }
         NavigationDecision::Deny => {
+          open_external_link_once(url.as_str());
           return tauri::webview::NewWindowResponse::Deny;
         }
         NavigationDecision::AllowBlank | NavigationDecision::AllowHttps => {}
