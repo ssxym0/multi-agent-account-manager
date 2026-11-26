@@ -3735,6 +3735,26 @@ fn open_external_link_once(raw_url: &str) {
   }
 }
 
+/// Meta 系外链跳转壳（l.meta.ai / l.facebook.com / l.instagram.com）：真实目标在
+/// u 参数里。壳域名本身在服务商白名单内，若不拆壳，站外链接会先进「登录认证」
+/// 弹窗、再在弹窗里被拦截成白屏。
+fn unwrap_link_shim(url: &Url) -> Option<Url> {
+  let host = url.host_str()?.to_ascii_lowercase();
+  if !matches!(
+    host.as_str(),
+    "l.meta.ai" | "l.facebook.com" | "lm.facebook.com" | "l.instagram.com"
+  ) {
+    return None;
+  }
+  let target = url
+    .query_pairs()
+    .find(|(key, _)| key == "u")
+    .map(|(_, value)| value.into_owned())?;
+  Url::parse(&target)
+    .ok()
+    .filter(|u| u.scheme() == "https" || u.scheme() == "http")
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ManagerSnapshot {
@@ -6578,6 +6598,15 @@ impl SessionManager {
         return tauri::webview::NewWindowResponse::Deny;
       }
       let decision = classify_top_level_url(&spec_for_popup, &url, true);
+      if let Some(target) = unwrap_link_shim(&url) {
+        if matches!(
+          classify_top_level_url(&spec_for_popup, &target, true),
+          NavigationDecision::Deny
+        ) {
+          open_external_link_once(target.as_str());
+          return tauri::webview::NewWindowResponse::Deny;
+        }
+      }
       match decision {
         NavigationDecision::ExternalGoogleOAuth => {
           let mgr_ext = Arc::clone(&mgr_for_popup);
@@ -6669,7 +6698,13 @@ impl SessionManager {
             });
             false
           }
-          NavigationDecision::Deny => false,
+          NavigationDecision::Deny => {
+            open_external_link_once(nav_url.as_str());
+            if let Some(pw) = app_popup_nav.get_webview_window(&popup_label_for_close) {
+              let _ = pw.close();
+            }
+            false
+          }
         }
       });
 
