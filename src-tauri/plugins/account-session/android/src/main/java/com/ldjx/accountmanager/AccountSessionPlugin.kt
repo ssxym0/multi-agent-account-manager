@@ -81,6 +81,13 @@ class ImportProfileCookiesArgs {
 }
 
 @InvokeArg
+class ExportProfileCookiesArgs {
+    var uuid: String = ""
+    var allowedHosts: Array<String> = emptyArray()
+    var urls: Array<String> = emptyArray()
+}
+
+@InvokeArg
 class OpenExternalUrlArgs {
     var url: String = ""
 }
@@ -90,6 +97,14 @@ class FetchTextArgs {
     var url: String = ""
     var userAgent: String = ""
     var accept: String? = null
+}
+
+@InvokeArg
+class HttpRequestArgs {
+    var method: String = "GET"
+    var url: String = ""
+    var headers: Map<String, String>? = null
+    var body: String? = null
 }
 
 @InvokeArg
@@ -285,13 +300,82 @@ class AccountSessionPlugin(private val activity: Activity) : Plugin(activity) {
                 cookieManager.setAcceptCookie(true)
                 for (header in args.cookies) {
                     if (header.isNotBlank()) {
-                        cookieManager.setCookie(args.url, header)
+                        val targetUrl = resolveCookieTargetUrl(header, args.url)
+                        cookieManager.setCookie(targetUrl, header)
                     }
                 }
                 cookieManager.flush()
                 invoke.resolve(JSObject())
             } catch (error: Exception) {
                 invoke.reject("导入 Cookie 失败，请检查格式后重试")
+            }
+        }
+    }
+
+    private fun resolveCookieTargetUrl(header: String, fallbackUrl: String): String {
+        val parts = header.split(';')
+        for (i in 1 until parts.size) {
+            val kv = parts[i].trim()
+            if (kv.startsWith("domain=", ignoreCase = true)) {
+                val rawDomain = kv.substring(7).trim().trim('.', ' ', '"')
+                if (rawDomain.isNotEmpty() && !rawDomain.contains('/') && !rawDomain.contains(' ')) {
+                    return "https://$rawDomain/"
+                }
+            }
+        }
+        return fallbackUrl
+    }
+
+    @Command
+    fun exportProfileCookies(invoke: Invoke) {
+        val args = invoke.parseArgs(ExportProfileCookiesArgs::class.java)
+        activity.runOnUiThread {
+            try {
+                if (!WebViewFeature.isFeatureSupported(WebViewFeature.MULTI_PROFILE)) {
+                    invoke.reject("系统 WebView 不支持 MULTI_PROFILE")
+                    return@runOnUiThread
+                }
+                val cookieManager = ProfileStore.getInstance().getProfile(args.uuid)?.cookieManager
+                val arr = JSArray()
+                if (cookieManager != null) {
+                    val seen = HashSet<String>()
+                    for (rawUrl in args.urls) {
+                        val u = rawUrl.trim()
+                        if (u.isEmpty()) continue
+                        val host = try {
+                            Uri.parse(u).host?.lowercase()?.trimStart('.') ?: ""
+                        } catch (_: Exception) {
+                            ""
+                        }
+                        if (host.isEmpty()) continue
+                        val rawCookie = cookieManager.getCookie(u) ?: continue
+                        for (pair in rawCookie.split(';')) {
+                            val trimmed = pair.trim()
+                            val eqIdx = trimmed.indexOf('=')
+                            if (eqIdx <= 0) continue
+                            val name = trimmed.substring(0, eqIdx).trim()
+                            val value = trimmed.substring(eqIdx + 1).trim()
+                            if (name.isEmpty()) continue
+                            val dedupKey = "$host|$name"
+                            if (!seen.add(dedupKey)) continue
+                            val item = JSObject().apply {
+                                put("name", name)
+                                put("value", value)
+                                put("domain", host)
+                                put("path", "/")
+                                put("secure", u.startsWith("https://", ignoreCase = true))
+                                put("httpOnly", false)
+                            }
+                            arr.put(item)
+                        }
+                    }
+                }
+                val ret = JSObject().apply {
+                    put("cookies", arr)
+                }
+                invoke.resolve(ret)
+            } catch (error: Exception) {
+                invoke.reject("导出 Cookie 失败，请稍后重试")
             }
         }
     }
@@ -338,6 +422,70 @@ class AccountSessionPlugin(private val activity: Activity) : Plugin(activity) {
                             if (n <= 0) break
                             totalRead += n
                             if (totalRead > 2 * 1024 * 1024) {
+                                throw IllegalStateException("响应内容过大")
+                            }
+                            out.write(buf, 0, n)
+                        }
+                        out.toString(Charsets.UTF_8.name())
+                    }
+                } else {
+                    ""
+                }
+                val ret = JSObject().apply {
+                    put("status", status)
+                    put("body", body)
+                }
+                invoke.resolve(ret)
+            } catch (t: Throwable) {
+                invoke.reject(t.message ?: "网络请求失败")
+            } finally {
+                conn?.disconnect()
+            }
+        }
+    }
+
+    @Command
+    fun httpRequest(invoke: Invoke) {
+        val args = invoke.parseArgs(HttpRequestArgs::class.java)
+        thread(name = "maam-relay-http") {
+            var conn: HttpURLConnection? = null
+            try {
+                val method = args.method.uppercase()
+                if (method !in setOf("GET", "POST", "DELETE")) {
+                    throw IllegalArgumentException("不支持的 HTTP 方法")
+                }
+                val parsed = URL(args.url)
+                if (!parsed.protocol.equals("https", ignoreCase = true)) {
+                    throw IllegalArgumentException("仅允许 HTTPS 中转地址")
+                }
+                conn = (parsed.openConnection() as HttpURLConnection).apply {
+                    instanceFollowRedirects = false
+                    connectTimeout = 15_000
+                    readTimeout = 25_000
+                    requestMethod = method
+                    useCaches = false
+                    args.headers?.forEach { (k, v) ->
+                        setRequestProperty(k, v)
+                    }
+                    if (args.body != null && method == "POST") {
+                        doOutput = true
+                        val bytes = args.body!!.toByteArray(Charsets.UTF_8)
+                        setFixedLengthStreamingMode(bytes.size)
+                        outputStream.use { it.write(bytes) }
+                    }
+                }
+                val status = conn.responseCode
+                val stream = if (status in 200..299) conn.inputStream else conn.errorStream
+                val body = if (stream != null) {
+                    stream.use { input ->
+                        val out = ByteArrayOutputStream()
+                        val buf = ByteArray(8192)
+                        var totalRead = 0
+                        while (true) {
+                            val n = input.read(buf)
+                            if (n <= 0) break
+                            totalRead += n
+                            if (totalRead > 4 * 1024 * 1024) {
                                 throw IllegalStateException("响应内容过大")
                             }
                             out.write(buf, 0, n)
@@ -578,6 +726,29 @@ class AccountSessionPlugin(private val activity: Activity) : Plugin(activity) {
             return conn
         }
         throw IllegalStateException("网络重定向次数过多")
+    }
+
+    @Command
+    fun scanQrCode(invoke: Invoke) {
+        activity.runOnUiThread {
+            try {
+                QrScannerBridge.setCallback { content, cancelled, error ->
+                    if (error != null) {
+                        invoke.reject(error)
+                    } else {
+                        val ret = JSObject().apply {
+                            put("content", content ?: "")
+                            put("cancelled", cancelled)
+                        }
+                        invoke.resolve(ret)
+                    }
+                }
+                val intent = Intent(activity, QrScannerActivity::class.java)
+                activity.startActivity(intent)
+            } catch (t: Throwable) {
+                invoke.reject(t.message ?: "无法打开扫码界面")
+            }
+        }
     }
 
     private fun computeSha256Hex(file: File): String {

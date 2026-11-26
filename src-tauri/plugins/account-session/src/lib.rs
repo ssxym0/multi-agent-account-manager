@@ -260,6 +260,46 @@ pub async fn import_profile_cookies(
 }
 
 #[cfg(mobile)]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MobileExportedCookie {
+  pub name: String,
+  pub value: String,
+  pub domain: String,
+  pub path: String,
+  pub secure: bool,
+  pub http_only: bool,
+  pub same_site: Option<String>,
+  pub max_age_secs: Option<i64>,
+}
+
+#[cfg(mobile)]
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MobileExportCookiesResponse {
+  cookies: Vec<MobileExportedCookie>,
+}
+
+#[cfg(mobile)]
+pub async fn export_profile_cookies(
+  app: &AppHandle,
+  uuid: &str,
+  allowed_hosts: Vec<String>,
+  urls: Vec<String>,
+) -> Result<Vec<MobileExportedCookie>, String> {
+  let bridge = app.state::<MobileSessionBridge<tauri::Wry>>();
+  let resp: MobileExportCookiesResponse = bridge
+    .0
+    .run_mobile_plugin_async(
+      "exportProfileCookies",
+      serde_json::json!({ "uuid": uuid, "allowedHosts": allowed_hosts, "urls": urls }),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+  Ok(resp.cookies)
+}
+
+#[cfg(mobile)]
 pub async fn open_external_url(app: &AppHandle, url: &str) -> Result<(), String> {
   let bridge = app.state::<MobileSessionBridge<tauri::Wry>>();
   bridge
@@ -291,6 +331,48 @@ pub async fn fetch_text(
         "accept": accept,
       }),
     )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+#[cfg(mobile)]
+pub async fn http_request(
+  app: &AppHandle,
+  method: &str,
+  url: &str,
+  headers: std::collections::HashMap<String, String>,
+  body: Option<String>,
+) -> Result<MobileFetchTextResponse, String> {
+  let bridge = app.state::<MobileSessionBridge<tauri::Wry>>();
+  bridge
+    .0
+    .run_mobile_plugin_async(
+      "httpRequest",
+      serde_json::json!({
+        "method": method,
+        "url": url,
+        "headers": headers,
+        "body": body,
+      }),
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+#[cfg(mobile)]
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MobileScanQrResponse {
+  pub content: String,
+  pub cancelled: bool,
+}
+
+#[cfg(mobile)]
+pub async fn scan_qr_code(app: &AppHandle) -> Result<MobileScanQrResponse, String> {
+  let bridge = app.state::<MobileSessionBridge<tauri::Wry>>();
+  bridge
+    .0
+    .run_mobile_plugin_async("scanQrCode", serde_json::json!({}))
     .await
     .map_err(|e| e.to_string())
 }

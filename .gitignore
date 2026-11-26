@@ -18,3 +18,4 @@ src-tauri/plugins/account-session/ios/.build
 *.jks
 *.p12
 keystore.properties
+.wrangler/

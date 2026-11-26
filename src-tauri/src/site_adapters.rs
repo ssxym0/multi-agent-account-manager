@@ -350,6 +350,7 @@ pub const NET_HOOK_INIT_JS: &str = r#"(() => {
       entries: [],
       wsLastAt: 0,
       wsText: '',
+      wsEvents: [],
       esLastAt: 0,
       esText: ''
     };
@@ -510,6 +511,26 @@ pub const NET_HOOK_INIT_JS: &str = r#"(() => {
                 }).catch(() => { entry.done = true; });
                 return;
               }
+              if (resp.clone && url.includes('/api/') && ct.includes('json')) {
+                resp.clone().json().then((d) => {
+                  if (d && typeof d === 'object') {
+                    const hasErr = Boolean(d.error || d.errors || d.code || d.ok === false || d.authenticated === false);
+                    if (hasErr || url.includes('/api/session') || url.includes('/api/auth/')) {
+                      entry.errorSnippet = JSON.stringify({
+                        keys: Object.keys(d).slice(0, 12),
+                        error: d.error,
+                        errors: d.errors,
+                        code: d.code,
+                        message: d.message,
+                        status: d.status,
+                        vm_resolution_issue: d.vm_resolution_issue,
+                        ok: d.ok,
+                        authenticated: d.authenticated
+                      }).slice(0, 240);
+                    }
+                  }
+                }).catch(() => {});
+              }
               const looksStream = ct.includes('event-stream') || ct.includes('ndjson') || ct.includes('stream');
               const looksChatPost = method === 'POST' && (ct.includes('json') || ct.includes('text') || looksStream);
               if (resp.ok && resp.clone && method === 'POST' && (looksStream || looksChatPost)) {
@@ -567,6 +588,16 @@ pub const NET_HOOK_INIT_JS: &str = r#"(() => {
           try {
             const u = String(args && args[0] ? args[0] : '');
             if (!TELEMETRY_RE.test(u)) {
+              state.wsEvents.push({ t: 'open', u: u.slice(0, 120) });
+              if (state.wsEvents.length > 10) state.wsEvents.shift();
+              ws.addEventListener('error', () => {
+                state.wsEvents.push({ t: 'err', u: u.slice(0, 120) });
+                if (state.wsEvents.length > 10) state.wsEvents.shift();
+              });
+              ws.addEventListener('close', (ev) => {
+                state.wsEvents.push({ t: 'close', code: ev && ev.code, reason: ev && ev.reason });
+                if (state.wsEvents.length > 10) state.wsEvents.shift();
+              });
               ws.addEventListener('message', (ev) => {
                 state.wsLastAt = Date.now();
                 if (typeof ev.data === 'string' && ev.data.startsWith('{')) {

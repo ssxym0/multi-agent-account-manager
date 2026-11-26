@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-start-lan-sync-share"
+description = "Enables the start_lan_sync_share command without any pre-configured scope."
+commands.allow = ["start_lan_sync_share"]
+
+[[permission]]
+identifier = "deny-start-lan-sync-share"
+description = "Denies the start_lan_sync_share command without any pre-configured scope."
+commands.deny = ["start_lan_sync_share"]

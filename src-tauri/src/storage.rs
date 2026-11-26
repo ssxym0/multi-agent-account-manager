@@ -18,6 +18,10 @@ fn default_relay_hops() -> u8 {
   2
 }
 
+fn default_silent_sync_interval_mins() -> u16 {
+  15
+}
+
 pub fn default_global_shortcut() -> String {
   #[cfg(target_os = "macos")]
   {
@@ -38,6 +42,10 @@ pub struct AppSettings {
   pub global_shortcut: String,
   #[serde(default)]
   pub auto_approve: bool,
+  #[serde(default = "default_true")]
+  pub isolate_same_proxy_keep_alive: bool,
+  #[serde(default = "default_silent_sync_interval_mins")]
+  pub silent_sync_interval_mins: u16,
 }
 
 impl Default for AppSettings {
@@ -46,6 +54,8 @@ impl Default for AppSettings {
       minimize_to_tray: true,
       global_shortcut: default_global_shortcut(),
       auto_approve: false,
+      isolate_same_proxy_keep_alive: true,
+      silent_sync_interval_mins: default_silent_sync_interval_mins(),
     }
   }
 }
@@ -560,6 +570,20 @@ fn migrate_from_value(root: Value) -> Result<(AccountsStoreFile, bool), String> 
       .and_then(|v| v.as_bool())
     {
       settings.auto_approve = auto_approve;
+    }
+    if let Some(isolate) = settings_obj
+      .get("isolateSameProxyKeepAlive")
+      .or_else(|| settings_obj.get("isolate_same_proxy_keep_alive"))
+      .and_then(|v| v.as_bool())
+    {
+      settings.isolate_same_proxy_keep_alive = isolate;
+    }
+    if let Some(interval) = settings_obj
+      .get("silentSyncIntervalMins")
+      .or_else(|| settings_obj.get("silent_sync_interval_mins"))
+      .and_then(|v| v.as_u64())
+    {
+      settings.silent_sync_interval_mins = interval.min(120) as u16;
     }
   }
 

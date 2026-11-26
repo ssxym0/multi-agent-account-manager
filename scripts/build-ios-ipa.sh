@@ -46,12 +46,28 @@ if "- sdk: Network.framework" not in text:
     anchor = "      - sdk: WebKit.framework\n"
     if anchor in text:
         text = text.replace(anchor, anchor + "      - sdk: Network.framework\n", 1)
+if "- sdk: AVFoundation.framework" not in text:
+    anchor = "      - sdk: Network.framework\n"
+    if anchor in text:
+        text = text.replace(anchor, anchor + "      - sdk: AVFoundation.framework\n", 1)
 
 text = text.replace("      PRODUCT_NAME: 叠号\n", "      PRODUCT_NAME: AccountManager\n")
 if "        CFBundleDisplayName:" not in text:
     text = text.replace(
         "        LSRequiresIPhoneOS: true\n",
         "        CFBundleDisplayName: 叠号\n        LSRequiresIPhoneOS: true\n",
+        1,
+    )
+if "        NSLocalNetworkUsageDescription:" not in text:
+    text = text.replace(
+        "        LSRequiresIPhoneOS: true\n",
+        "        LSRequiresIPhoneOS: true\n        NSLocalNetworkUsageDescription: 用于局域网多端加密同步账号与登录态\n",
+        1,
+    )
+if "        NSCameraUsageDescription:" not in text:
+    text = text.replace(
+        "        NSLocalNetworkUsageDescription: 用于局域网多端加密同步账号与登录态\n",
+        "        NSLocalNetworkUsageDescription: 用于局域网多端加密同步账号与登录态\n        NSCameraUsageDescription: 用于扫描局域网同步二维码，快速导入账号与登录态\n",
         1,
     )
 

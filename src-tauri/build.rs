@@ -39,6 +39,13 @@ const APP_COMMANDS: &[&str] = &[
   "check_for_updates",
   "download_and_install_update",
   "open_external_url",
+  "export_sync_bundle",
+  "import_sync_bundle",
+  "start_lan_sync_share",
+  "start_relay_sync_share",
+  "stop_lan_sync_share",
+  "pull_lan_sync_share",
+  "scan_sync_qr_code",
 ];
 
 fn main() {

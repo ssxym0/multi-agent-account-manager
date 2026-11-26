@@ -47,6 +47,27 @@ private struct ImportProfileCookiesArgs: Decodable {
   let cookies: [String]
 }
 
+private struct ExportProfileCookiesArgs: Decodable {
+  let uuid: String
+  let allowedHosts: [String]
+  let urls: [String]?
+}
+
+private struct ExportedCookieItem: Encodable {
+  let name: String
+  let value: String
+  let domain: String
+  let path: String
+  let secure: Bool
+  let httpOnly: Bool
+  let sameSite: String?
+  let maxAgeSecs: Int64?
+}
+
+private struct ExportProfileCookiesResult: Encodable {
+  let cookies: [ExportedCookieItem]
+}
+
 private struct OpenExternalUrlArgs: Decodable {
   let url: String
 }
@@ -57,6 +78,13 @@ private struct FetchTextArgs: Decodable {
   let accept: String?
 }
 
+private struct HttpRequestArgs: Decodable {
+  let method: String
+  let url: String
+  let headers: [String: String]?
+  let body: String?
+}
+
 private struct CapabilitiesResult: Encodable {
   let multiProfileSupported: Bool
   let profileNames: [String]
@@ -65,6 +93,11 @@ private struct CapabilitiesResult: Encodable {
 private struct FetchTextResult: Encodable {
   let status: UInt16
   let body: String
+}
+
+private struct ScanQrCodeResult: Encodable {
+  let content: String
+  let cancelled: Bool
 }
 
 @_cdecl("init_plugin_account_session")
@@ -315,6 +348,60 @@ public class AccountSessionPlugin: Plugin {
     }
   }
 
+  @objc public func exportProfileCookies(_ invoke: Invoke) {
+    do {
+      let args = try invoke.parseArgs(ExportProfileCookiesArgs.self)
+      guard #available(iOS 17.0, *) else {
+        invoke.reject("导出 Cookie 需要 iOS 17.0 及以上系统")
+        return
+      }
+      guard let parsedUuid = UUID(uuidString: args.uuid) else {
+        invoke.reject("账号资料标识无效")
+        return
+      }
+      let allowed = args.allowedHosts.map { $0.trimmingCharacters(in: CharacterSet(charactersIn: ".")).lowercased() }.filter { !$0.isEmpty }
+      DispatchQueue.main.async {
+        let store = WKWebsiteDataStore(forIdentifier: parsedUuid)
+        store.httpCookieStore.getAllCookies { cookies in
+          let now = Date()
+          var items: [ExportedCookieItem] = []
+          for cookie in cookies {
+            if let exp = cookie.expiresDate, exp <= now {
+              continue
+            }
+            let rawDomain = cookie.domain.lowercased()
+            let normDomain = rawDomain.trimmingCharacters(in: CharacterSet(charactersIn: "."))
+            if normDomain.isEmpty { continue }
+            let matched = allowed.isEmpty || allowed.contains { ah in
+              normDomain == ah || normDomain.hasSuffix("." + ah) || ah.hasSuffix("." + normDomain)
+            }
+            if !matched { continue }
+            var maxAge: Int64? = nil
+            if let exp = cookie.expiresDate {
+              let secs = Int64(exp.timeIntervalSince(now))
+              if secs > 0 {
+                maxAge = min(secs, 365 * 86400)
+              }
+            }
+            items.append(ExportedCookieItem(
+              name: cookie.name,
+              value: cookie.value,
+              domain: rawDomain.hasPrefix(".") ? rawDomain : normDomain,
+              path: cookie.path.isEmpty ? "/" : cookie.path,
+              secure: cookie.isSecure,
+              httpOnly: cookie.isHTTPOnly,
+              sameSite: nil,
+              maxAgeSecs: maxAge
+            ))
+          }
+          invoke.resolve(ExportProfileCookiesResult(cookies: items))
+        }
+      }
+    } catch {
+      invoke.reject("导出 Cookie 失败: \(error.localizedDescription)")
+    }
+  }
+
   @objc public func openExternalUrl(_ invoke: Invoke) {
     do {
       let args = try invoke.parseArgs(OpenExternalUrlArgs.self)
@@ -378,6 +465,76 @@ public class AccountSessionPlugin: Plugin {
       task.resume()
     } catch {
       invoke.reject("解析网络请求参数失败")
+    }
+  }
+
+  @objc public func httpRequest(_ invoke: Invoke) {
+    do {
+      let args = try invoke.parseArgs(HttpRequestArgs.self)
+      let method = args.method.uppercased()
+      guard method == "GET" || method == "POST" || method == "DELETE" else {
+        invoke.reject("不支持的 HTTP 方法")
+        return
+      }
+      guard let url = URL(string: args.url),
+            url.scheme?.lowercased() == "https" else {
+        invoke.reject("仅允许 HTTPS 中转地址")
+        return
+      }
+      var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 25)
+      req.httpMethod = method
+      if let headers = args.headers {
+        for (k, v) in headers {
+          req.setValue(v, forHTTPHeaderField: k)
+        }
+      }
+      if let body = args.body, method == "POST" {
+        req.httpBody = body.data(using: .utf8)
+      }
+
+      let delegate = HttpsOnlyRedirectDelegate()
+      let session = URLSession(configuration: .ephemeral, delegate: delegate, delegateQueue: nil)
+      let task = session.dataTask(with: req) { data, response, err in
+        session.finishTasksAndInvalidate()
+        if let err = err {
+          invoke.reject("网络请求失败: \(err.localizedDescription)")
+          return
+        }
+        guard let httpResp = response as? HTTPURLResponse,
+              httpResp.url?.scheme?.lowercased() == "https" else {
+          invoke.reject("响应重定向到了非 HTTPS 地址")
+          return
+        }
+        let payload = data ?? Data()
+        if payload.count > 4 * 1024 * 1024 {
+          invoke.reject("响应内容过大")
+          return
+        }
+        let body = String(data: payload, encoding: .utf8) ?? ""
+        invoke.resolve(FetchTextResult(status: UInt16(httpResp.statusCode), body: body))
+      }
+      task.resume()
+    } catch {
+      invoke.reject("解析网络请求参数失败")
+    }
+  }
+
+  @objc public func scanQrCode(_ invoke: Invoke) {
+    DispatchQueue.main.async { [weak self] in
+      guard let self = self, let presenter = self.resolvePresenterViewController() else {
+        invoke.reject("无法打开扫码界面")
+        return
+      }
+      let vc = QrScannerViewController { content, cancelled, error in
+        if let error = error {
+          invoke.reject(error)
+        } else if cancelled {
+          invoke.resolve(ScanQrCodeResult(content: "", cancelled: true))
+        } else {
+          invoke.resolve(ScanQrCodeResult(content: content ?? "", cancelled: false))
+        }
+      }
+      presenter.present(vc, animated: true)
     }
   }
 

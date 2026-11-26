@@ -1,0 +1,15 @@
+name = "maam-sync-relay"
+main = "src/index.js"
+compatibility_date = "2026-01-01"
+
+routes = [
+  { pattern = "sync.ldjx7.qzz.io", custom_domain = true }
+]
+
+[[durable_objects.bindings]]
+name = "RELAY_DROPS"
+class_name = "RelayDropDO"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["RelayDropDO"]

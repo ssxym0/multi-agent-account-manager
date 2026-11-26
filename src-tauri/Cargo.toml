@@ -1,6 +1,6 @@
 [package]
 name = "multi-agent-account-manager"
-version = "0.1.10"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.85"
 
@@ -16,16 +16,23 @@ tauri = { version = "=2.12.6", features = [] }
 tauri-plugin-account-session = { path = "plugins/account-session" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
+tokio = { version = "1", features = ["sync", "rt", "macros", "time", "net", "io-util"] }
 url = "2"
 uuid = { version = "1", features = ["v4"] }
+sha2 = "0.10"
+aes-gcm = "0.10"
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+hmac = "0.12"
+base64 = "0.22"
+rand = "0.8"
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+if-addrs = "0.13"
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri = { version = "=2.12.6", features = ["unstable", "tray-icon", "image-png"] }
 tauri-plugin-global-shortcut = "2.3.2"
 open = "5"
 reqwest = { version = "0.13", default-features = false, features = ["native-tls", "http2", "system-proxy"] }
-sha2 = "0.10"
 
 [target.'cfg(any(target_os = "macos", windows))'.dependencies]
 arboard = { version = "3.6.1", default-features = false }

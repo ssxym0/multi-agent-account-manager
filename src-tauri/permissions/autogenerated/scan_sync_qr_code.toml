@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-scan-sync-qr-code"
+description = "Enables the scan_sync_qr_code command without any pre-configured scope."
+commands.allow = ["scan_sync_qr_code"]
+
+[[permission]]
+identifier = "deny-scan-sync-qr-code"
+description = "Denies the scan_sync_qr_code command without any pre-configured scope."
+commands.deny = ["scan_sync_qr_code"]

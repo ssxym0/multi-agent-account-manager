@@ -4,14 +4,18 @@ mod providers;
 mod session_manager;
 mod site_adapters;
 mod storage;
+mod sync_bundle;
 mod updater;
 
 use platform::ProxyTestResult;
-use session_manager::{ManagerSnapshot, SessionManager, APP_TITLE};
+use session_manager::{
+  ImportSyncBundleResponse, ManagerSnapshot, ScanQrResult, SessionManager, APP_TITLE,
+};
 use site_adapters::SiteAdaptersSnapshot;
 use storage::{
   AccountKey, ExternalAgentKind, GroupMemberRole, GroupSharedSkill, GroupWorkflowMode,
 };
+use sync_bundle::{ExportSyncBundleResponse, LanSyncShareInfo};
 #[cfg(desktop)]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -245,13 +249,113 @@ async fn update_app_settings(
   minimize_to_tray: bool,
   global_shortcut: String,
   auto_approve: Option<bool>,
+  isolate_same_proxy_keep_alive: Option<bool>,
+  silent_sync_interval_mins: Option<u16>,
 ) -> Result<ManagerSnapshot, String> {
   if webview.label() != "manager" {
     return Err("仅账号管理页可以修改应用设置".to_string());
   }
   mgr
-    .update_app_settings(&app, minimize_to_tray, &global_shortcut, auto_approve)
+    .update_app_settings(
+      &app,
+      minimize_to_tray,
+      &global_shortcut,
+      auto_approve,
+      isolate_same_proxy_keep_alive,
+      silent_sync_interval_mins,
+    )
     .await
+}
+
+#[tauri::command]
+async fn export_sync_bundle(
+  app: AppHandle,
+  mgr: State<'_, Arc<SessionManager>>,
+  webview: tauri::Webview,
+  passphrase: String,
+) -> Result<ExportSyncBundleResponse, String> {
+  if webview.label() != "manager" {
+    return Err("仅账号管理页可以导出同步备份".to_string());
+  }
+  mgr.export_sync_bundle(&app, passphrase).await
+}
+
+#[tauri::command]
+async fn import_sync_bundle(
+  app: AppHandle,
+  mgr: State<'_, Arc<SessionManager>>,
+  webview: tauri::Webview,
+  bundle_json: String,
+  passphrase: String,
+) -> Result<ImportSyncBundleResponse, String> {
+  if webview.label() != "manager" {
+    return Err("仅账号管理页可以导入同步备份".to_string());
+  }
+  mgr.import_sync_bundle(&app, bundle_json, passphrase).await
+}
+
+#[tauri::command]
+async fn start_lan_sync_share(
+  app: AppHandle,
+  mgr: State<'_, Arc<SessionManager>>,
+  webview: tauri::Webview,
+  passphrase: Option<String>,
+) -> Result<LanSyncShareInfo, String> {
+  if webview.label() != "manager" {
+    return Err("仅账号管理页可以开启局域网同步".to_string());
+  }
+  mgr.start_lan_sync_share(&app, passphrase).await
+}
+
+#[tauri::command]
+async fn start_relay_sync_share(
+  app: AppHandle,
+  mgr: State<'_, Arc<SessionManager>>,
+  webview: tauri::Webview,
+  relay_url: Option<String>,
+) -> Result<LanSyncShareInfo, String> {
+  if webview.label() != "manager" {
+    return Err("仅账号管理页可以开启加密中转同步".to_string());
+  }
+  mgr.start_relay_sync_share(&app, relay_url).await
+}
+
+#[tauri::command]
+async fn stop_lan_sync_share(
+  app: AppHandle,
+  mgr: State<'_, Arc<SessionManager>>,
+  webview: tauri::Webview,
+) -> Result<(), String> {
+  if webview.label() != "manager" {
+    return Err("仅账号管理页可以停止同步共享".to_string());
+  }
+  mgr.stop_lan_sync_share(&app).await
+}
+
+#[tauri::command]
+async fn pull_lan_sync_share(
+  app: AppHandle,
+  mgr: State<'_, Arc<SessionManager>>,
+  webview: tauri::Webview,
+  address: String,
+  passphrase: String,
+) -> Result<ImportSyncBundleResponse, String> {
+  if webview.label() != "manager" {
+    return Err("仅账号管理页可以拉取局域网同步".to_string());
+  }
+  mgr.pull_lan_sync_share(&app, address, passphrase).await
+}
+
+#[tauri::command]
+async fn scan_sync_qr_code(
+  app: AppHandle,
+  mgr: State<'_, Arc<SessionManager>>,
+  webview: tauri::Webview,
+) -> Result<ScanQrResult, String> {
+  if webview.label() != "manager" {
+    return Err("仅账号管理页可以调用扫码同步".to_string());
+  }
+  mgr.scan_sync_qr_code(&app).await
 }
 
 #[tauri::command]
@@ -694,6 +798,13 @@ pub fn run() {
       check_for_updates,
       download_and_install_update,
       open_external_url,
+      export_sync_bundle,
+      import_sync_bundle,
+      start_lan_sync_share,
+      start_relay_sync_share,
+      stop_lan_sync_share,
+      pull_lan_sync_share,
+      scan_sync_qr_code,
     ])
     .build(tauri::generate_context!())
     .expect("error while building tauri application")

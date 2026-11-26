@@ -1322,6 +1322,87 @@ pub async fn read_macos_cookie_header(
     .map(|(header, _)| header)
 }
 
+#[cfg(target_os = "macos")]
+pub async fn read_macos_cookie_specs_for_hosts(
+  app: &tauri::AppHandle,
+  uuid: Uuid,
+  allowed_hosts: Vec<String>,
+) -> Result<Vec<ImportedCookieSpec>, String> {
+  use objc2::{AnyThread, MainThreadMarker};
+  use objc2_foundation::{NSArray, NSHTTPCookie, NSString, NSUUID};
+  use objc2_web_kit::WKWebsiteDataStore;
+  use std::cell::RefCell;
+  use std::ptr::NonNull;
+
+  let (sender, receiver) = tokio::sync::oneshot::channel();
+  app
+    .run_on_main_thread(move || {
+      let identifier = NSString::from_str(&uuid.to_string());
+      let Some(identifier) = NSUUID::initWithUUIDString(NSUUID::alloc(), &identifier) else {
+        let _ = sender.send(Err("账号资料标识无效".to_string()));
+        return;
+      };
+      let Some(main_thread) = MainThreadMarker::new() else {
+        let _ = sender.send(Err("读取账号 Cookie 失败".to_string()));
+        return;
+      };
+      let store = unsafe { WKWebsiteDataStore::dataStoreForIdentifier(&identifier, main_thread) };
+      let sender = RefCell::new(Some(sender));
+      let callback = block2::RcBlock::new(move |cookies: NonNull<NSArray<NSHTTPCookie>>| {
+        let now_ms = crate::storage::now_ms();
+        let mut out = Vec::new();
+        for cookie in unsafe { cookies.as_ref() }.to_vec() {
+          let raw_domain = cookie.domain().to_string();
+          let domain_norm = raw_domain.trim().trim_start_matches('.').to_ascii_lowercase();
+          if domain_norm.is_empty()
+            || (!allowed_hosts.is_empty()
+              && !allowed_hosts
+                .iter()
+                .any(|allowed| crate::providers::host_matches(&domain_norm, allowed)))
+          {
+            continue;
+          }
+          let expires_at_ms = cookie
+            .expiresDate()
+            .and_then(|date| unix_secs_f64_to_ms(date.timeIntervalSince1970()));
+          let expired = expires_at_ms.is_some_and(|exp| exp <= now_ms)
+            || cookie.expiresDate().is_some_and(|date| date.timeIntervalSinceNow() <= 0.0);
+          if expired {
+            continue;
+          }
+          let name = cookie.name().to_string();
+          if name.is_empty() {
+            continue;
+          }
+          let value = cookie.value().to_string();
+          let path = cookie.path().to_string();
+          let max_age_secs = expires_at_ms
+            .map(|exp| ((exp.saturating_sub(now_ms)) / 1000).clamp(1, 365 * 86_400) as i64);
+          out.push(ImportedCookieSpec {
+            name,
+            value,
+            domain: if raw_domain.starts_with('.') {
+              raw_domain.to_ascii_lowercase()
+            } else {
+              domain_norm
+            },
+            path: if path.is_empty() { "/".to_string() } else { path },
+            secure: cookie.isSecure(),
+            http_only: cookie.isHTTPOnly(),
+            same_site: None,
+            max_age_secs,
+          });
+        }
+        if let Some(sender) = sender.borrow_mut().take() {
+          let _ = sender.send(Ok(out));
+        }
+      });
+      unsafe { store.httpCookieStore().getAllCookies(&callback) };
+    })
+    .map_err(|_| "读取账号 Cookie 失败".to_string())?;
+  receiver.await.map_err(|_| "读取账号 Cookie 中断".to_string())?
+}
+
 #[cfg(any(target_os = "macos", windows))]
 pub async fn write_cookie_clipboard(app: &tauri::AppHandle, header: String) -> Result<(), String> {
   #[cfg(target_os = "macos")]
@@ -1347,7 +1428,8 @@ pub async fn write_cookie_clipboard(app: &tauri::AppHandle, header: String) -> R
   receiver.await.map_err(|_| "写入系统剪贴板中断".to_string())?
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ImportedCookieSpec {
   pub name: String,
   pub value: String,

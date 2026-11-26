@@ -4,10 +4,10 @@ use crate::group_transport::ResolvedMemberTransport;
 use crate::platform::{self, current_platform_name, ProxyTestResult};
 use crate::providers::{
   all_provider_infos, classify_top_level_url, resolve_provider, NavigationDecision, ProviderId,
-  ProviderInfo,
+  ProviderInfo, ProviderSpec,
 };
 #[cfg(desktop)]
-use crate::providers::{is_verified_callback_origin, ProviderSpec};
+use crate::providers::is_verified_callback_origin;
 #[cfg(desktop)]
 use crate::site_adapters::SiteAdapterConfig;
 use crate::site_adapters::{self, SiteAdaptersSnapshot};
@@ -115,6 +115,40 @@ const LOGIN_CAPTURE_INIT_JS: &str = r#"(() => {
       inflight: false
     };
     window.__maamAuthCheck = authCheck;
+    const pageErrors = window.__maamPageErrors || [];
+    window.__maamPageErrors = pageErrors;
+    const pushPageErr = (kind, raw) => {
+      try {
+        const s = String(raw || '').replace(/\s+/g, ' ').trim().slice(0, 320);
+        if (!s) return;
+        pageErrors.push({ t: Date.now(), k: kind, m: s });
+        if (pageErrors.length > 12) pageErrors.splice(0, pageErrors.length - 12);
+      } catch (_) {}
+    };
+    try {
+      window.addEventListener('error', (ev) => {
+        pushPageErr('error', (ev && ev.message) || (ev && ev.error && ev.error.stack) || 'script error');
+      }, true);
+      window.addEventListener('unhandledrejection', (ev) => {
+        const r = ev ? ev.reason : '';
+        pushPageErr('rej', (r && (r.stack || r.message)) || r);
+      });
+      if (console && typeof console.error === 'function' && !console.__maamErrHooked) {
+        const origConsoleErr = console.error.bind(console);
+        console.__maamErrHooked = true;
+        console.error = function(...args) {
+          try {
+            const msg = args.map((a) => {
+              if (typeof a === 'string') return a;
+              if (a && typeof a === 'object') return a.message || a.stack || JSON.stringify(a);
+              return String(a);
+            }).join(' ');
+            pushPageErr('console', msg);
+          } catch (_) {}
+          return origConsoleErr(...args);
+        };
+      }
+    } catch (_) {}
     const markAuthInvalid = (reason) => {
       authCheck.status = 'invalid';
       authCheck.reason = String(reason || 'unauthorized');
@@ -1193,8 +1227,47 @@ const IDENTITY_PROBE_JS: &str = r#"(() => {
       } catch (_) {}
       return JSON.stringify({ auth: false, loggedOut: true, staleSession: Boolean(staleSession), pageError: '', typed: typed || phone, email: '', displayName: '', avatar: '', quotaText: '', quotaPct: null, quotaDetail: null, pendingHotkey });
     };
-    const makeLoading = () => JSON.stringify({ auth: false, loggedOut: false, staleSession: false, pageError: '', typed: typed || phone, email: '', displayName: '', avatar: '', quotaText: '', quotaPct: null, quotaDetail: null, pendingHotkey });
-    const makePageError = (msg) => JSON.stringify({ auth: false, loggedOut: false, staleSession: false, pageError: String(msg || ''), typed: typed || phone, email: '', displayName: '', avatar: '', quotaText: '', quotaPct: null, quotaDetail: null, pendingHotkey });
+    const makeLoading = () => JSON.stringify({ auth: false, loggedOut: false, staleSession: false, pageError: '', pageDiag: '', typed: typed || phone, email: '', displayName: '', avatar: '', quotaText: '', quotaPct: null, quotaDetail: null, pendingHotkey });
+    const makePageError = (msg) => {
+      let pageDiag = '';
+      try {
+        const net = (window.__maamNet && Array.isArray(window.__maamNet.entries))
+          ? window.__maamNet.entries.slice(-18).map((e) => ({
+              m: e.method,
+              u: e.url,
+              s: e.status,
+              ct: e.contentType,
+              err: e.errorSnippet
+            }))
+          : [];
+        const perfFailed = (performance && typeof performance.getEntriesByType === 'function')
+          ? performance.getEntriesByType('resource')
+              .filter((r) => typeof r.responseStatus === 'number' && r.responseStatus >= 400)
+              .slice(-10)
+              .map((r) => ({ u: String(r.name || '').slice(0, 140), s: r.responseStatus }))
+          : [];
+        const digests = [];
+        document.querySelectorAll('script').forEach((sc) => {
+          const t = sc.textContent || '';
+          if (t.includes('digest') || t.includes('NEXT_HTTP_ERROR_FALLBACK') || t.includes('Error')) {
+            const idx = t.indexOf('digest');
+            if (idx >= 0) digests.push(t.slice(Math.max(0, idx - 40), idx + 140));
+          }
+        });
+        pageDiag = JSON.stringify({
+          url: location.href,
+          auth: window.__maamAuthCheck || null,
+          errors: (window.__maamPageErrors || []).slice(-10),
+          ws: (window.__maamNet && window.__maamNet.wsEvents) ? window.__maamNet.wsEvents.slice(-8) : [],
+          perfFailed,
+          digests: digests.slice(0, 5),
+          net,
+          body: ((document.body && document.body.innerText) || '').slice(0, 300),
+          html: ((document.querySelector('main') || document.body) ? ((document.querySelector('main') || document.body).innerHTML || '').slice(0, 500) : '')
+        });
+      } catch (_) {}
+      return JSON.stringify({ auth: false, loggedOut: false, staleSession: false, pageError: String(msg || ''), pageDiag, typed: typed || phone, email: '', displayName: '', avatar: '', quotaText: '', quotaPct: null, quotaDetail: null, pendingHotkey });
+    };
     if (document.readyState === 'loading') {
       return makeLoading();
     }
@@ -3777,6 +3850,7 @@ pub struct ManagerSnapshot {
   pub active_group_id: Option<String>,
   pub external_agents: Vec<ExternalAgentRecord>,
   pub account_errors: Vec<AccountPageError>,
+  pub official_relay_url: Option<String>,
 }
 
 #[cfg(desktop)]
@@ -3999,6 +4073,22 @@ struct InnerState {
   global_shortcut_active: bool,
   global_shortcut_error: Option<String>,
   active_group_id: Option<String>,
+  lan_sync_cancel: Option<tokio::sync::oneshot::Sender<()>>,
+  active_relay_drop: Option<crate::sync_bundle::ActiveRelayDrop>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportSyncBundleResponse {
+  pub snapshot: ManagerSnapshot,
+  pub summary: crate::sync_bundle::SyncImportSummary,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScanQrResult {
+  pub content: String,
+  pub cancelled: bool,
 }
 
 pub struct SessionManager {
@@ -4077,6 +4167,8 @@ impl SessionManager {
         global_shortcut_active: false,
         global_shortcut_error: None,
         active_group_id: None,
+        lan_sync_cancel: None,
+        active_relay_drop: None,
       }),
     }
   }
@@ -4175,6 +4267,7 @@ impl SessionManager {
       active_group_id: locked.active_group_id.clone(),
       external_agents: locked.store.external_agents.clone(),
       account_errors,
+      official_relay_url: crate::sync_bundle::official_relay_url(),
     }
   }
 
@@ -4234,11 +4327,17 @@ impl SessionManager {
     let mgr_periodic = Arc::clone(self);
     let app_periodic = app.clone();
     tauri::async_runtime::spawn(async move {
-      let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5 * 60));
+      let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
       interval.tick().await;
       loop {
         interval.tick().await;
-        mgr_periodic.trigger_silent_sync(&app_periodic, false).await;
+        let interval_mins = {
+          let locked = mgr_periodic.inner.lock().await;
+          locked.store.settings.silent_sync_interval_mins
+        };
+        if interval_mins > 0 {
+          mgr_periodic.trigger_silent_sync(&app_periodic, false).await;
+        }
       }
     });
 
@@ -4376,6 +4475,70 @@ impl SessionManager {
   }
 
   #[cfg(desktop)]
+  fn normalized_proxy_group(account: &AccountRecord) -> (ProviderId, String) {
+    let proxy = account
+      .proxy_url
+      .as_deref()
+      .map(str::trim)
+      .filter(|s| !s.is_empty())
+      .unwrap_or("")
+      .to_ascii_lowercase();
+    (account.provider_id.clone(), proxy)
+  }
+
+  #[cfg(desktop)]
+  fn proxy_group_for_key(locked: &InnerState, key: &AccountKey) -> (ProviderId, String) {
+    locked
+      .store
+      .accounts
+      .iter()
+      .find(|a| a.provider_id == key.provider_id && a.uuid == key.uuid)
+      .map(Self::normalized_proxy_group)
+      .unwrap_or_else(|| (key.provider_id.clone(), String::new()))
+  }
+
+  #[cfg(desktop)]
+  fn has_warm_proxy_conflict(locked: &InnerState, key: &AccountKey) -> bool {
+    let target_group = Self::proxy_group_for_key(locked, key);
+    if let Some(slot) = &locked.active_slot {
+      if slot.account_key != *key && Self::proxy_group_for_key(locked, &slot.account_key) == target_group {
+        return true;
+      }
+    }
+    locked
+      .warm_pool
+      .keys()
+      .any(|k| *k != *key && Self::proxy_group_for_key(locked, k) == target_group)
+  }
+
+  #[cfg(desktop)]
+  fn evict_same_proxy_group_warm_entries(
+    app: &AppHandle,
+    locked: &mut InnerState,
+    keep_key: &AccountKey,
+  ) {
+    let target_group = Self::proxy_group_for_key(locked, keep_key);
+    let needs_auth_members = Self::group_needs_auth_members(locked);
+    let victims: Vec<AccountKey> = locked
+      .warm_pool
+      .keys()
+      .filter(|k| {
+        *k != keep_key
+          && Self::proxy_group_for_key(locked, k) == target_group
+          && locked.active_slot.as_ref().map(|s| &s.account_key) != Some(*k)
+          && locked.in_flight_group_members.get(*k).copied().unwrap_or(0) == 0
+          && !needs_auth_members.contains(*k)
+      })
+      .cloned()
+      .collect();
+    for victim in victims {
+      if let Some(entry) = locked.warm_pool.remove(&victim) {
+        Self::close_warm_entry(app, entry);
+      }
+    }
+  }
+
+  #[cfg(desktop)]
   fn evict_warm_pool_if_needed(
     app: &AppHandle,
     locked: &mut InnerState,
@@ -4431,20 +4594,52 @@ impl SessionManager {
         return;
       }
 
-      if !in_group && locked.warm_pool.len() <= 2 {
-        return;
+      candidates.sort_by_key(|(_, last_used)| *last_used);
+      let isolate_same_proxy = locked.store.settings.isolate_same_proxy_keep_alive;
+      let mut closed_any = false;
+      if isolate_same_proxy {
+        let mut duplicate_victims: Vec<AccountKey> = Vec::new();
+        let mut group_counts: HashMap<(ProviderId, String), usize> = HashMap::new();
+        for k in locked.warm_pool.keys() {
+          *group_counts
+            .entry(Self::proxy_group_for_key(&locked, k))
+            .or_insert(0) += 1;
+        }
+        if let Some(slot) = &locked.active_slot {
+          if !locked.warm_pool.contains_key(&slot.account_key) {
+            *group_counts
+              .entry(Self::proxy_group_for_key(&locked, &slot.account_key))
+              .or_insert(0) += 1;
+          }
+        }
+        for (victim, _) in &candidates {
+          let group = Self::proxy_group_for_key(&locked, victim);
+          if group_counts.get(&group).copied().unwrap_or(0) > 1 {
+            duplicate_victims.push(victim.clone());
+            if let Some(cnt) = group_counts.get_mut(&group) {
+              *cnt = cnt.saturating_sub(1);
+            }
+          }
+        }
+        for victim in &duplicate_victims {
+          if let Some(entry) = locked.warm_pool.remove(victim) {
+            Self::close_warm_entry(app, entry);
+            closed_any = true;
+          }
+        }
+        candidates.retain(|(k, _)| !duplicate_victims.contains(k));
       }
 
-      candidates.sort_by_key(|(_, last_used)| *last_used);
-      let keep_recent = if in_group { 0 } else { 2.min(locked.warm_pool.len()) };
-      let mut closed_any = false;
-      for (victim, _) in candidates {
-        if !in_group && locked.warm_pool.len() <= keep_recent {
-          break;
-        }
-        if let Some(entry) = locked.warm_pool.remove(&victim) {
-          Self::close_warm_entry(app, entry);
-          closed_any = true;
+      if !candidates.is_empty() && (in_group || locked.warm_pool.len() > 2) {
+        let keep_recent = if in_group { 0 } else { 2.min(locked.warm_pool.len()) };
+        for (victim, _) in candidates {
+          if !in_group && locked.warm_pool.len() <= keep_recent {
+            break;
+          }
+          if let Some(entry) = locked.warm_pool.remove(&victim) {
+            Self::close_warm_entry(app, entry);
+            closed_any = true;
+          }
         }
       }
 
@@ -5136,6 +5331,122 @@ impl SessionManager {
     result
   }
 
+  #[cfg(windows)]
+  async fn read_windows_cookie_specs_for_hosts(
+    &self,
+    app: &AppHandle,
+    locked: &InnerState,
+    key: &AccountKey,
+    urls: Vec<Url>,
+  ) -> Result<Vec<platform::ImportedCookieSpec>, String> {
+    let profile_dir = locked.app_data_dir.join("profiles").join(&key.uuid);
+    let uuid = Uuid::parse_str(&key.uuid).map_err(|_| "账号资料标识无效".to_string())?;
+    let existing = locked
+      .warm_pool
+      .get(key)
+      .and_then(|entry| app.get_webview(&entry.webview_label));
+    let temporary = existing.is_none();
+    let webview = match existing {
+      Some(webview) => webview,
+      None => {
+        if !profile_dir.is_dir() {
+          return Ok(Vec::new());
+        }
+        let account = locked
+          .store
+          .accounts
+          .iter()
+          .find(|account| account.provider_id == key.provider_id && account.uuid == key.uuid)
+          .ok_or_else(|| "未找到可用的账号".to_string())?;
+        let proxy =
+          platform::parse_account_proxy(account.proxy_url.as_deref().unwrap_or_default())?;
+        let window = app
+          .get_window("main")
+          .ok_or_else(|| "主窗口不存在".to_string())?;
+        let instance_id = self.view_counter.fetch_add(1, Ordering::SeqCst);
+        let builder = tauri::webview::WebviewBuilder::new(
+          format!("sync-cookie-{instance_id}"),
+          tauri::WebviewUrl::External("about:blank".parse().expect("valid blank url")),
+        )
+        .data_directory(profile_dir.clone())
+        .on_navigation(|url| url.as_str() == "about:blank")
+        .focused(false);
+        let builder =
+          platform::with_windows_account_proxy(builder, proxy.as_ref(), &app.config().identifier)?;
+        let (position, size) = Self::initial_hidden_child_rect(&window);
+        let webview = window
+          .add_child(builder, position, size)
+          .map_err(|_| "无法打开该账号的会话资料".to_string())?;
+        let _ = webview.hide();
+        webview
+      }
+    };
+
+    let result = async {
+      platform::verify_desktop_profile_binding(&webview, uuid, &profile_dir).await?;
+      let wv_clone = webview.clone();
+      tauri::async_runtime::spawn_blocking(move || {
+        let current_ms = now_ms();
+        let mut out = Vec::new();
+        let mut seen: HashSet<(String, String, String)> = HashSet::new();
+        for url in urls {
+          let Ok(cookies) = wv_clone.cookies_for_url(url.clone()) else {
+            continue;
+          };
+          let fallback_host = url.host_str().unwrap_or("").to_ascii_lowercase();
+          for cookie in &cookies {
+            let max_age_secs = match cookie.expires_datetime() {
+              None => None,
+              Some(dt) => match platform::unix_secs_i64_to_ms(dt.unix_timestamp()) {
+                Some(exp) if exp > current_ms => {
+                  Some(((exp.saturating_sub(current_ms)) / 1000).clamp(1, 365 * 86_400) as i64)
+                }
+                _ => continue,
+              },
+            };
+            let name = cookie.name().to_string();
+            if name.is_empty() {
+              continue;
+            }
+            let domain = cookie
+              .domain()
+              .map(|d| d.trim().to_ascii_lowercase())
+              .filter(|d| !d.is_empty())
+              .unwrap_or_else(|| fallback_host.clone());
+            let path = cookie
+              .path()
+              .map(|p| p.to_string())
+              .filter(|p| !p.is_empty())
+              .unwrap_or_else(|| "/".to_string());
+            let dedup_key = (domain.clone(), path.clone(), name.clone());
+            if !seen.insert(dedup_key) {
+              continue;
+            }
+            out.push(platform::ImportedCookieSpec {
+              name,
+              value: cookie.value().to_string(),
+              domain,
+              path,
+              secure: cookie.secure().unwrap_or(true),
+              http_only: cookie.http_only().unwrap_or(false),
+              same_site: None,
+              max_age_secs,
+            });
+          }
+        }
+        Ok::<Vec<platform::ImportedCookieSpec>, String>(out)
+      })
+      .await
+      .map_err(|_| "读取账号 Cookie 中断".to_string())?
+    }
+    .await;
+
+    if temporary {
+      let _ = webview.close();
+    }
+    result
+  }
+
   async fn write_imported_cookies_to_store(
     &self,
     app: &AppHandle,
@@ -5718,11 +6029,13 @@ impl SessionManager {
   }
 
   pub async fn update_app_settings(
-    &self,
+    self: &Arc<Self>,
     app: &AppHandle,
     minimize_to_tray: bool,
     raw_shortcut: &str,
     auto_approve: Option<bool>,
+    isolate_same_proxy_keep_alive: Option<bool>,
+    silent_sync_interval_mins: Option<u16>,
   ) -> Result<ManagerSnapshot, String> {
     let shortcut = raw_shortcut.trim().to_string();
     if shortcut.chars().count() > 80 {
@@ -5757,15 +6070,47 @@ impl SessionManager {
 
     let next_auto_approve = auto_approve.unwrap_or_else(|| self.auto_approve.load(Ordering::SeqCst));
 
-    let (snap, warm_labels) = {
+    let (snap, warm_labels, became_unisolated) = {
       let mut locked = self.inner.lock().await;
       let previous = locked.store.settings.clone();
+      let next_isolate = isolate_same_proxy_keep_alive.unwrap_or(previous.isolate_same_proxy_keep_alive);
+      let next_interval = silent_sync_interval_mins
+        .map(|v| v.min(120))
+        .unwrap_or(previous.silent_sync_interval_mins);
       locked.store.settings.minimize_to_tray = minimize_to_tray;
       locked.store.settings.global_shortcut = shortcut;
       locked.store.settings.auto_approve = next_auto_approve;
+      locked.store.settings.isolate_same_proxy_keep_alive = next_isolate;
+      locked.store.settings.silent_sync_interval_mins = next_interval;
       if let Err(err) = save_store_atomic(&locked.store_path, &locked.store) {
         locked.store.settings = previous;
         return Err(err);
+      }
+      #[cfg(desktop)]
+      if next_isolate {
+        if let Some(active_key) = locked.active_slot.as_ref().map(|s| s.account_key.clone()) {
+          Self::evict_same_proxy_group_warm_entries(app, &mut locked, &active_key);
+        } else {
+          let mut seen_groups: HashSet<(ProviderId, String)> = HashSet::new();
+          let needs_auth_members = Self::group_needs_auth_members(&locked);
+          let mut entries: Vec<(AccountKey, u64)> = locked
+            .warm_pool
+            .iter()
+            .map(|(k, e)| (k.clone(), e.last_used_ms))
+            .collect();
+          entries.sort_by_key(|(_, ts)| std::cmp::Reverse(*ts));
+          for (k, _) in entries {
+            let group = Self::proxy_group_for_key(&locked, &k);
+            if !seen_groups.insert(group)
+              && locked.in_flight_group_members.get(&k).copied().unwrap_or(0) == 0
+              && !needs_auth_members.contains(&k)
+            {
+              if let Some(entry) = locked.warm_pool.remove(&k) {
+                Self::close_warm_entry(app, entry);
+              }
+            }
+          }
+        }
       }
       self.minimize_to_tray.store(minimize_to_tray, Ordering::SeqCst);
       self.auto_approve.store(next_auto_approve, Ordering::SeqCst);
@@ -5779,7 +6124,11 @@ impl SessionManager {
         .collect::<Vec<_>>();
       #[cfg(not(desktop))]
       let labels: Vec<String> = Vec::new();
-      (Self::snapshot_from_locked(&locked), labels)
+      (
+        Self::snapshot_from_locked(&locked),
+        labels,
+        previous.isolate_same_proxy_keep_alive && !next_isolate,
+      )
     };
 
     #[cfg(desktop)]
@@ -5793,9 +6142,16 @@ impl SessionManager {
           let _ = wv.eval(&sync_js);
         }
       }
+      if became_unisolated {
+        let mgr_prewarm = Arc::clone(self);
+        let app_prewarm = app.clone();
+        tauri::async_runtime::spawn(async move {
+          mgr_prewarm.prewarm_next_cold_account(&app_prewarm).await;
+        });
+      }
     }
     #[cfg(not(desktop))]
-    let _ = warm_labels;
+    let _ = (warm_labels, became_unisolated);
 
     Ok(snap)
   }
@@ -5816,6 +6172,598 @@ impl SessionManager {
     {
       let _ = download_id;
       Err("当前平台不支持打开本地文件夹".to_string())
+    }
+  }
+
+  #[cfg_attr(target_os = "macos", allow(dead_code))]
+  fn collect_provider_cookie_urls(spec: &ProviderSpec) -> Vec<Url> {
+    let mut urls = Vec::new();
+    let mut seen = HashSet::new();
+    if let Ok(u) = Url::parse(&spec.info.entry_url) {
+      if seen.insert(u.as_str().to_string()) {
+        urls.push(u);
+      }
+    }
+    for host in &spec.allowed_hosts {
+      let clean = host.trim().trim_start_matches('.').to_ascii_lowercase();
+      if clean.is_empty() {
+        continue;
+      }
+      if let Ok(u) = Url::parse(&format!("https://{clean}/")) {
+        if seen.insert(u.as_str().to_string()) {
+          urls.push(u);
+        }
+      }
+    }
+    urls
+  }
+
+  async fn build_sync_bundle_payload(
+    &self,
+    app: &AppHandle,
+  ) -> Result<(crate::sync_bundle::SyncBundlePayload, usize), String> {
+    let (accounts, group_chats, external_agents) = {
+      let locked = self.inner.lock().await;
+      if !locked.conflicts.is_empty() {
+        return Err("存在 UUID 归属冲突，请先处理冲突后再导出".to_string());
+      }
+      let accounts = locked
+        .store
+        .accounts
+        .iter()
+        .filter(|a| {
+          !locked
+            .store
+            .pending_cleanup
+            .iter()
+            .any(|p| p.provider_id == a.provider_id && p.uuid == a.uuid)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+      (
+        accounts,
+        locked.store.group_chats.clone(),
+        locked.store.external_agents.clone(),
+      )
+    };
+
+    let mut account_cookies: std::collections::BTreeMap<String, Vec<platform::ImportedCookieSpec>> =
+      std::collections::BTreeMap::new();
+    let mut cookie_account_count = 0usize;
+
+    for acc in &accounts {
+      let Some(spec) = resolve_provider(&acc.provider_id) else {
+        continue;
+      };
+      if !spec.info.enabled {
+        continue;
+      }
+      let key_str = format!("{}:{}", acc.provider_id.as_str(), acc.uuid);
+      let mut cookie_specs: Vec<platform::ImportedCookieSpec> = Vec::new();
+
+      #[cfg(target_os = "macos")]
+      {
+        let _ = app;
+        if let Ok(parsed_uuid) = Uuid::parse_str(&acc.uuid) {
+          if let Ok(list) = platform::read_macos_cookie_specs_for_hosts(
+            app,
+            parsed_uuid,
+            spec.allowed_hosts.clone(),
+          )
+          .await
+          {
+            cookie_specs = list;
+          }
+        }
+      }
+
+      #[cfg(windows)]
+      {
+        let key = AccountKey {
+          provider_id: acc.provider_id.clone(),
+          uuid: acc.uuid.clone(),
+        };
+        let urls = Self::collect_provider_cookie_urls(&spec);
+        let locked = self.inner.lock().await;
+        if let Ok(list) = self
+          .read_windows_cookie_specs_for_hosts(app, &locked, &key, urls)
+          .await
+        {
+          cookie_specs = list;
+        }
+      }
+
+      #[cfg(mobile)]
+      {
+        let urls = Self::collect_provider_cookie_urls(&spec)
+          .into_iter()
+          .map(|u| u.to_string())
+          .collect::<Vec<_>>();
+        if let Ok(list) = platform::mobile::export_profile_cookies(
+          app,
+          &acc.uuid,
+          spec.allowed_hosts.clone(),
+          urls,
+        )
+        .await
+        {
+          cookie_specs = list
+            .into_iter()
+            .map(|c| platform::ImportedCookieSpec {
+              name: c.name,
+              value: c.value,
+              domain: c.domain,
+              path: c.path,
+              secure: c.secure,
+              http_only: c.http_only,
+              same_site: c.same_site,
+              max_age_secs: c.max_age_secs,
+            })
+            .collect();
+        }
+      }
+
+      #[cfg(not(any(target_os = "macos", windows, mobile)))]
+      {
+        let _ = (app, &spec);
+      }
+
+      if !cookie_specs.is_empty() {
+        cookie_account_count += 1;
+        account_cookies.insert(key_str, cookie_specs);
+      }
+    }
+
+    let payload = crate::sync_bundle::SyncBundlePayload {
+      schema_version: 1,
+      exported_at_ms: now_ms(),
+      source_platform: platform::current_platform_name().to_string(),
+      accounts,
+      account_cookies,
+      group_chats,
+      external_agents,
+    };
+    Ok((payload, cookie_account_count))
+  }
+
+  async fn apply_sync_bundle(
+    self: &Arc<Self>,
+    app: &AppHandle,
+    payload: crate::sync_bundle::SyncBundlePayload,
+  ) -> Result<ImportSyncBundleResponse, String> {
+    let mut added_accounts = 0usize;
+    let mut updated_accounts = 0usize;
+    let mut merged_groups = 0usize;
+    let mut merged_external_agents = 0usize;
+    let mut pending_cookie_writes: Vec<(
+      AccountKey,
+      ProviderSpec,
+      String,
+      PathBuf,
+      Vec<platform::ImportedCookieSpec>,
+    )> = Vec::new();
+
+    {
+      let mut locked = self.inner.lock().await;
+      if !locked.conflicts.is_empty() {
+        return Err("存在 UUID 归属冲突，请先处理冲突后再导入".to_string());
+      }
+
+      for mut incoming in payload.accounts {
+        let Some(norm_uuid) = normalize_uuid(&incoming.uuid) else {
+          continue;
+        };
+        if resolve_provider(&incoming.provider_id).is_none() {
+          continue;
+        }
+        incoming.uuid = norm_uuid.clone();
+        if locked.store.accounts.iter().any(|existing| {
+          existing.uuid == norm_uuid && existing.provider_id != incoming.provider_id
+        }) {
+          continue;
+        }
+        let proxy_valid = if platform::SUPPORTS_ACCOUNT_PROXY {
+          incoming
+            .proxy_url
+            .as_deref()
+            .and_then(|p| platform::parse_account_proxy(p).ok().flatten())
+            .map(|u| platform::format_account_proxy(&u))
+        } else {
+          None
+        };
+        let tz_valid = incoming
+          .timezone
+          .as_deref()
+          .and_then(|t| platform::parse_account_timezone(t).ok().flatten());
+
+        if let Some(existing) = locked.store.accounts.iter_mut().find(|a| {
+          a.provider_id == incoming.provider_id && a.uuid == incoming.uuid
+        }) {
+          if !incoming.alias.trim().is_empty() {
+            existing.alias = incoming.alias.clone();
+            existing.auto_alias = incoming.auto_alias;
+          }
+          if incoming.created_at_ms > 0
+            && (existing.created_at_ms == 0 || incoming.created_at_ms < existing.created_at_ms)
+          {
+            existing.created_at_ms = incoming.created_at_ms;
+          }
+          if platform::SUPPORTS_ACCOUNT_PROXY && proxy_valid.is_some() {
+            existing.proxy_url = proxy_valid;
+          }
+          if tz_valid.is_some() {
+            existing.timezone = tz_valid;
+          }
+          if existing.avatar_url.is_none() && incoming.avatar_url.is_some() {
+            existing.avatar_url = incoming.avatar_url;
+          }
+          updated_accounts += 1;
+        } else {
+          let mut rec = incoming;
+          rec.proxy_url = proxy_valid;
+          rec.timezone = tz_valid;
+          rec.auth_state = AuthState::Unknown;
+          rec.cookie_expires_at_ms = None;
+          rec.cookie_session_only = false;
+          if rec.alias.trim().is_empty() {
+            rec.alias = format!("账号 {}", locked.store.accounts.len() + 1);
+            rec.auto_alias = true;
+          }
+          locked.store.accounts.push(rec);
+          added_accounts += 1;
+        }
+      }
+
+      for ext in payload.external_agents {
+        if ext.id.trim().is_empty() || ext.name.trim().is_empty() {
+          continue;
+        }
+        if !locked.store.external_agents.iter().any(|e| e.id == ext.id) {
+          locked.store.external_agents.push(ext);
+          merged_external_agents += 1;
+        }
+      }
+
+      for mut grp in payload.group_chats {
+        if grp.id.trim().is_empty() || grp.name.trim().is_empty() {
+          continue;
+        }
+        let accs_snapshot = locked.store.accounts.clone();
+        let exts_snapshot = locked.store.external_agents.clone();
+        let member_valid = |m: &AccountKey| -> bool {
+          if m.provider_id.is_external() {
+            exts_snapshot.iter().any(|e| e.account_key() == *m)
+          } else {
+            accs_snapshot
+              .iter()
+              .any(|a| a.provider_id == m.provider_id && a.uuid == m.uuid)
+          }
+        };
+        grp.members.retain(&member_valid);
+        grp.member_roles.retain(|r| member_valid(&r.member));
+        grp.thread_bindings.retain(|tb| member_valid(&tb.member));
+        if let Some(existing) = locked.store.group_chats.iter_mut().find(|g| g.id == grp.id) {
+          for m in grp.members {
+            if !existing.members.contains(&m) {
+              existing.members.push(m);
+            }
+          }
+          if existing.shared_context.trim().is_empty() && !grp.shared_context.trim().is_empty() {
+            existing.shared_context = grp.shared_context;
+          }
+          for sk in grp.shared_skills {
+            if !existing.shared_skills.iter().any(|s| s.id == sk.id) {
+              existing.shared_skills.push(sk);
+            }
+          }
+          for msg in grp.messages {
+            if !existing.messages.iter().any(|m| m.id == msg.id) {
+              existing.messages.push(msg);
+            }
+          }
+        } else if !grp.members.is_empty() {
+          locked.store.group_chats.push(grp);
+          merged_groups += 1;
+        }
+      }
+
+      let app_data_dir = locked.app_data_dir.clone();
+      for acc in &locked.store.accounts {
+        let key_str = format!("{}:{}", acc.provider_id.as_str(), acc.uuid);
+        let Some(specs) = payload.account_cookies.get(&key_str) else {
+          continue;
+        };
+        if specs.is_empty() {
+          continue;
+        }
+        let Some(spec) = resolve_provider(&acc.provider_id) else {
+          continue;
+        };
+        if !spec.info.enabled {
+          continue;
+        }
+        let key = AccountKey {
+          provider_id: acc.provider_id.clone(),
+          uuid: acc.uuid.clone(),
+        };
+        pending_cookie_writes.push((
+          key,
+          spec,
+          acc.proxy_url.clone().unwrap_or_default(),
+          app_data_dir.join("profiles").join(&acc.uuid),
+          specs.clone(),
+        ));
+      }
+
+      save_store_atomic(&locked.store_path, &locked.store)?;
+    }
+
+    let mut imported_cookie_accounts = 0usize;
+    let mut skipped_cookie_accounts = 0usize;
+    let mut refreshed_keys: Vec<AccountKey> = Vec::new();
+
+    for (key, spec, proxy_raw, profile_dir, specs) in pending_cookie_writes {
+      let Ok(url) = Url::parse(&spec.info.entry_url) else {
+        skipped_cookie_accounts += 1;
+        continue;
+      };
+      match self
+        .write_imported_cookies_to_store(app, &key, &url, &proxy_raw, &profile_dir, &specs)
+        .await
+      {
+        Ok(_) => {
+          imported_cookie_accounts += 1;
+          refreshed_keys.push(key);
+        }
+        Err(_) => {
+          skipped_cookie_accounts += 1;
+        }
+      }
+    }
+
+    let snap = {
+      let mut locked = self.inner.lock().await;
+      for key in &refreshed_keys {
+        locked.account_page_errors.remove(key);
+        #[cfg(desktop)]
+        {
+          locked.prewarm_failed.remove(key);
+          locked.cookie_checked_at.remove(key);
+        }
+        if let Some(target) = locked
+          .store
+          .accounts
+          .iter_mut()
+          .find(|a| a.provider_id == key.provider_id && a.uuid == key.uuid)
+        {
+          target.auth_state = AuthState::Unknown;
+          target.cookie_expires_at_ms = None;
+          target.cookie_session_only = false;
+        }
+      }
+      let _ = save_store_atomic(&locked.store_path, &locked.store);
+      locked.notice = Some(format!(
+        "同步完成：新增 {} 个账号，更新 {} 个账号，写入 {} 个账号登录态",
+        added_accounts, updated_accounts, imported_cookie_accounts
+      ));
+      Self::snapshot_from_locked(&locked)
+    };
+
+    self.emit_snapshot(app, &snap);
+
+    #[cfg(desktop)]
+    for key in refreshed_keys {
+      let should_reload = {
+        let locked = self.inner.lock().await;
+        locked
+          .active_slot
+          .as_ref()
+          .is_some_and(|s| s.account_key == key)
+          || locked.warm_pool.contains_key(&key)
+      };
+      if should_reload {
+        let _ = self
+          .reload_account(app, key.provider_id.as_str(), &key.uuid)
+          .await;
+      }
+    }
+
+    Ok(ImportSyncBundleResponse {
+      snapshot: snap,
+      summary: crate::sync_bundle::SyncImportSummary {
+        added_accounts,
+        updated_accounts,
+        imported_cookie_accounts,
+        skipped_cookie_accounts,
+        merged_groups,
+        merged_external_agents,
+      },
+    })
+  }
+
+  pub async fn export_sync_bundle(
+    &self,
+    app: &AppHandle,
+    passphrase: String,
+  ) -> Result<crate::sync_bundle::ExportSyncBundleResponse, String> {
+    let (payload, cookie_account_count) = self.build_sync_bundle_payload(app).await?;
+    let account_count = payload.accounts.len();
+    let bundle_json = crate::sync_bundle::encrypt_sync_bundle(&payload, &passphrase)?;
+    let filename = format!("account-manager-sync-{}.maam", now_ms() / 1000);
+
+    #[cfg(desktop)]
+    let (saved_path, download_id) = {
+      let base_dir = app
+        .path()
+        .download_dir()
+        .ok()
+        .filter(|p| p.exists())
+        .unwrap_or_else(|| app.path().app_data_dir().unwrap_or_else(|_| PathBuf::from(".")));
+      let dest = base_dir.join(&filename);
+      if std::fs::write(&dest, bundle_json.as_bytes()).is_ok() {
+        let id = self.download_counter.fetch_add(1, Ordering::SeqCst);
+        self
+          .recent_downloads
+          .lock()
+          .unwrap()
+          .insert(id, dest.clone());
+        (Some(dest.to_string_lossy().to_string()), Some(id))
+      } else {
+        (None, None)
+      }
+    };
+    #[cfg(not(desktop))]
+    let (saved_path, download_id) = {
+      let _ = app;
+      (None, None)
+    };
+
+    Ok(crate::sync_bundle::ExportSyncBundleResponse {
+      filename,
+      saved_path,
+      download_id,
+      bundle_json,
+      account_count,
+      cookie_account_count,
+    })
+  }
+
+  pub async fn import_sync_bundle(
+    self: &Arc<Self>,
+    app: &AppHandle,
+    bundle_json: String,
+    passphrase: String,
+  ) -> Result<ImportSyncBundleResponse, String> {
+    let payload = crate::sync_bundle::decrypt_sync_bundle(&bundle_json, &passphrase)?;
+    self.apply_sync_bundle(app, payload).await
+  }
+
+  pub async fn start_lan_sync_share(
+    &self,
+    app: &AppHandle,
+    passphrase: Option<String>,
+  ) -> Result<crate::sync_bundle::LanSyncShareInfo, String> {
+    let _ = self.stop_lan_sync_share(app).await;
+
+    let pass = match passphrase.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+      Some(p) => crate::sync_bundle::validate_sync_passphrase(p)?,
+      None => crate::sync_bundle::generate_lan_pin(),
+    };
+
+    let (payload, cookie_account_count) = self.build_sync_bundle_payload(app).await?;
+    let account_count = payload.accounts.len();
+    let encrypted = crate::sync_bundle::encrypt_sync_bundle(&payload, &pass)?;
+    let started = crate::sync_bundle::spawn_lan_sync_server(encrypted, pass.clone(), 3, 180).await?;
+
+    {
+      let mut locked = self.inner.lock().await;
+      if let Some(prev) = locked.lan_sync_cancel.take() {
+        let _ = prev.send(());
+      }
+      locked.lan_sync_cancel = Some(started.cancel_tx);
+    }
+
+    Ok(crate::sync_bundle::LanSyncShareInfo {
+      mode: "lan".to_string(),
+      relay_url: None,
+      address: started.address,
+      passphrase: pass,
+      sync_uri: started.sync_uri,
+      qr_svg: started.qr_svg,
+      expires_at_ms: started.expires_at_ms,
+      max_downloads: started.max_downloads,
+      account_count,
+      cookie_account_count,
+    })
+  }
+
+  pub async fn start_relay_sync_share(
+    &self,
+    app: &AppHandle,
+    relay_url: Option<String>,
+  ) -> Result<crate::sync_bundle::LanSyncShareInfo, String> {
+    let _ = self.stop_lan_sync_share(app).await;
+
+    let base_url =
+      crate::sync_bundle::normalize_relay_base_url(relay_url.as_deref().unwrap_or(""))?;
+    let (payload, cookie_account_count) = self.build_sync_bundle_payload(app).await?;
+    let account_count = payload.accounts.len();
+    let prepared = crate::sync_bundle::prepare_relay_drop(&payload, &base_url, 3, 180)?;
+    crate::sync_bundle::upload_relay_drop(app, &base_url, prepared.upload_json).await?;
+
+    {
+      let mut locked = self.inner.lock().await;
+      locked.active_relay_drop = Some(crate::sync_bundle::ActiveRelayDrop {
+        relay_url: base_url.clone(),
+        channel_id: prepared.channel_id.clone(),
+        delete_token: prepared.delete_token,
+      });
+    }
+
+    let host = url::Url::parse(&base_url)
+      .ok()
+      .and_then(|u| u.host_str().map(str::to_string))
+      .unwrap_or_else(|| base_url.clone());
+
+    Ok(crate::sync_bundle::LanSyncShareInfo {
+      mode: "relay".to_string(),
+      relay_url: Some(base_url),
+      address: format!("{host} / {}", &prepared.channel_id[..8]),
+      passphrase: "每次随机 256-bit 密钥（仅含于二维码）".to_string(),
+      sync_uri: prepared.sync_uri,
+      qr_svg: prepared.qr_svg,
+      expires_at_ms: prepared.expires_at_ms,
+      max_downloads: prepared.max_downloads,
+      account_count,
+      cookie_account_count,
+    })
+  }
+
+  pub async fn stop_lan_sync_share(&self, app: &AppHandle) -> Result<(), String> {
+    let relay_drop = {
+      let mut locked = self.inner.lock().await;
+      if let Some(cancel) = locked.lan_sync_cancel.take() {
+        let _ = cancel.send(());
+      }
+      locked.active_relay_drop.take()
+    };
+    if let Some(drop) = relay_drop {
+      let _ = crate::sync_bundle::delete_relay_drop(app, &drop).await;
+    }
+    Ok(())
+  }
+
+  pub async fn pull_lan_sync_share(
+    self: &Arc<Self>,
+    app: &AppHandle,
+    address: String,
+    passphrase: String,
+  ) -> Result<ImportSyncBundleResponse, String> {
+    if crate::sync_bundle::is_relay_sync_uri(&address) {
+      let target = crate::sync_bundle::parse_relay_target(&address, &passphrase)?;
+      let resp = crate::sync_bundle::fetch_relay_drop(app, &target).await?;
+      let payload = crate::sync_bundle::decrypt_relay_drop(&resp, &target.key)?;
+      return self.apply_sync_bundle(app, payload).await;
+    }
+    let (ip, port, pass) = crate::sync_bundle::parse_lan_target(&address, &passphrase)?;
+    let encrypted = crate::sync_bundle::fetch_lan_sync_bundle(ip, port, &pass).await?;
+    let payload = crate::sync_bundle::decrypt_sync_bundle(&encrypted, &pass)?;
+    self.apply_sync_bundle(app, payload).await
+  }
+
+  pub async fn scan_sync_qr_code(&self, app: &AppHandle) -> Result<ScanQrResult, String> {
+    #[cfg(mobile)]
+    {
+      let res = platform::mobile::scan_qr_code(app).await?;
+      Ok(ScanQrResult {
+        content: res.content,
+        cancelled: res.cancelled,
+      })
+    }
+    #[cfg(not(mobile))]
+    {
+      let _ = app;
+      Err("桌面端请使用加密备份文件或输入局域网同步地址".to_string())
     }
   }
 
@@ -5936,9 +6884,20 @@ impl SessionManager {
 
   pub async fn trigger_silent_sync(self: &Arc<Self>, app: &AppHandle, force: bool) {
     let now = now_ms();
+    let (isolate_same_proxy, interval_mins) = {
+      let locked = self.inner.lock().await;
+      (
+        locked.store.settings.isolate_same_proxy_keep_alive,
+        locked.store.settings.silent_sync_interval_mins,
+      )
+    };
     if !force {
+      if interval_mins == 0 {
+        return;
+      }
+      let cooldown_ms = (interval_mins as u64) * 60_000;
       let last = self.last_sync_timestamp.load(Ordering::SeqCst);
-      if now > last && now - last < 30_000 {
+      if now > last && now - last < cooldown_ms {
         return;
       }
     }
@@ -5946,7 +6905,7 @@ impl SessionManager {
 
     #[cfg(not(desktop))]
     {
-      let _ = app;
+      let _ = (app, isolate_same_proxy);
     }
 
     #[cfg(desktop)]
@@ -5956,9 +6915,11 @@ impl SessionManager {
         if force {
           locked.prewarm_failed.clear();
         }
+        let active_key = locked.active_slot.as_ref().map(|s| s.account_key.clone());
         locked
           .warm_pool
           .iter()
+          .filter(|(k, _)| force || !isolate_same_proxy || active_key.as_ref() == Some(*k))
           .map(|(k, v)| (k.clone(), v.webview_label.clone(), v.view_instance_id))
           .collect::<Vec<_>>()
       };
@@ -5966,7 +6927,10 @@ impl SessionManager {
       #[cfg(target_os = "macos")]
       let warm_set: HashSet<AccountKey> = warm_targets.iter().map(|(k, _, _)| k.clone()).collect();
 
-      for (key, wv_label, vid) in warm_targets {
+      for (idx, (key, wv_label, vid)) in warm_targets.into_iter().enumerate() {
+        if idx > 0 {
+          tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        }
         if let Some(wv) = app.get_webview(&wv_label) {
           let _ = wv.eval(r#"(() => {
             try {
@@ -6070,11 +7034,13 @@ impl SessionManager {
         }
       }
 
-      let mgr_prewarm = Arc::clone(self);
-      let app_prewarm = app.clone();
-      tauri::async_runtime::spawn(async move {
-        mgr_prewarm.prewarm_next_cold_account(&app_prewarm).await;
-      });
+      if force || !isolate_same_proxy {
+        let mgr_prewarm = Arc::clone(self);
+        let app_prewarm = app.clone();
+        tauri::async_runtime::spawn(async move {
+          mgr_prewarm.prewarm_next_cold_account(&app_prewarm).await;
+        });
+      }
     }
   }
 
@@ -6156,6 +7122,9 @@ impl SessionManager {
           locked.notice = None;
           locked.prewarm_failed.remove(&key);
           self.hide_foreground_slot(app, next_seq, &mut locked).await;
+          if locked.store.settings.isolate_same_proxy_keep_alive {
+            Self::evict_same_proxy_group_warm_entries(app, &mut locked, &key);
+          }
 
           let warm_state = locked.warm_pool.get(&key).and_then(|entry| {
             if app.get_webview(&entry.webview_label).is_some() {
@@ -7451,6 +8420,12 @@ impl SessionManager {
       if locked.store.pending_cleanup.contains(&key) {
         return Err("账号资料正在清理".to_string());
       }
+      if !allow_evict_for_group
+        && locked.store.settings.isolate_same_proxy_keep_alive
+        && Self::has_warm_proxy_conflict(&locked, &key)
+      {
+        return Ok(());
+      }
       if allow_evict_for_group && locked.warm_pool.len() >= MAX_WARM_DESKTOP_VIEWS {
         Self::evict_warm_pool_if_needed(
           app,
@@ -7485,6 +8460,9 @@ impl SessionManager {
       if locked.warm_pool.contains_key(&key)
         || locked.store.pending_cleanup.contains(&key)
         || locked.warm_pool.len() >= MAX_WARM_DESKTOP_VIEWS
+        || (!allow_evict_for_group
+          && locked.store.settings.isolate_same_proxy_keep_alive
+          && Self::has_warm_proxy_conflict(&locked, &key))
         || !locked.store.accounts.iter().any(|record| {
           record.provider_id == key.provider_id && record.uuid == key.uuid
         })
@@ -7551,6 +8529,20 @@ impl SessionManager {
         {
           None
         } else {
+          let isolate_same_proxy = locked.store.settings.isolate_same_proxy_keep_alive;
+          let occupied_proxy_groups: HashSet<(ProviderId, String)> = if isolate_same_proxy {
+            let mut set: HashSet<(ProviderId, String)> = locked
+              .warm_pool
+              .keys()
+              .map(|k| Self::proxy_group_for_key(&locked, k))
+              .collect();
+            if let Some(slot) = &locked.active_slot {
+              set.insert(Self::proxy_group_for_key(&locked, &slot.account_key));
+            }
+            set
+          } else {
+            HashSet::new()
+          };
           let is_eligible_cold = |a: &&AccountRecord| {
             if !resolve_provider(&a.provider_id).is_some_and(|s| s.info.enabled) {
               return false;
@@ -7562,6 +8554,8 @@ impl SessionManager {
             !locked.warm_pool.contains_key(&k)
               && !locked.store.pending_cleanup.contains(&k)
               && !locked.prewarm_failed.contains(&k)
+              && (!isolate_same_proxy
+                || !occupied_proxy_groups.contains(&Self::normalized_proxy_group(a)))
           };
           locked
             .store
@@ -8441,6 +9435,9 @@ impl SessionManager {
           consecutive_page_error = consecutive_page_error.saturating_add(1);
           if consecutive_page_error >= 2 {
             mgr
+              .record_page_error_diag(&key, &probe.page_error, &probe.page_diag)
+              .await;
+            mgr
               .apply_page_error_state(&app, key.clone(), view_instance_id, probe.page_error)
               .await;
             next_delay_ms = Some(if tick_count < 6 { 950 } else { 6500 });
@@ -8482,6 +9479,12 @@ impl SessionManager {
     let stale_session = val.get("staleSession").and_then(|v| v.as_bool()).unwrap_or(false);
     let page_error = val
       .get("pageError")
+      .and_then(|v| v.as_str())
+      .unwrap_or("")
+      .trim()
+      .to_string();
+    let page_diag = val
+      .get("pageDiag")
       .and_then(|v| v.as_str())
       .unwrap_or("")
       .trim()
@@ -8535,6 +9538,7 @@ impl SessionManager {
       logged_out,
       stale_session,
       page_error,
+      page_diag,
       typed,
       email,
       display_name,
@@ -8589,6 +9593,32 @@ impl SessionManager {
     }
     locked.account_page_errors.insert(key, trimmed);
     Some(Self::snapshot_from_locked(locked))
+  }
+
+  #[cfg(desktop)]
+  async fn record_page_error_diag(&self, key: &AccountKey, error: &str, diag: &str) {
+    use std::io::Write;
+    let path = {
+      let locked = self.inner.lock().await;
+      locked.app_data_dir.join("page_error_diag.log")
+    };
+    let ts = now_ms();
+    let line = format!(
+      "ts={ts} provider={} uuid={} error={} diag={}\n",
+      key.provider_id.as_str(),
+      key.uuid,
+      error,
+      diag
+    );
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+      if existing.len() > 256 * 1024 {
+        let _ = std::fs::write(&path, line.as_bytes());
+        return;
+      }
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+      let _ = f.write_all(line.as_bytes());
+    }
   }
 
   #[cfg_attr(not(desktop), allow(dead_code))]
@@ -12837,6 +13867,7 @@ struct DesktopProbeResult {
   logged_out: bool,
   stale_session: bool,
   page_error: String,
+  page_diag: String,
   typed: String,
   email: String,
   display_name: String,
