@@ -3703,6 +3703,12 @@ fn build_group_sync_latest_js(adapter: &SiteAdapterConfig, raw_user_content: &st
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct AccountPageError {
+  pub provider_id: ProviderId,
+  pub uuid: String,
+  pub message: String,
+}
+
 /// 把被内嵌页拦截的站外链接交给系统浏览器打开；同一链接 3 秒内只打开一次，
 /// 避免重定向链或重复触发刷出一堆浏览器标签页。
 fn open_external_link_once(raw_url: &str) {
@@ -3727,12 +3733,6 @@ fn open_external_link_once(raw_url: &str) {
   {
     let _ = platform::open_external_browser(raw_url);
   }
-}
-
-pub struct AccountPageError {
-  pub provider_id: ProviderId,
-  pub uuid: String,
-  pub message: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
