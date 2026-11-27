@@ -472,27 +472,33 @@ public class AccountSessionPlugin: Plugin {
     do {
       let args = try invoke.parseArgs(HttpRequestArgs.self)
       let method = args.method.uppercased()
-      guard method == "GET" || method == "POST" || method == "DELETE" else {
+      let allowedMethods: Set<String> = ["GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS", "MKCOL", "PROPFIND"]
+      guard allowedMethods.contains(method) else {
         invoke.reject("不支持的 HTTP 方法")
         return
       }
       guard let url = URL(string: args.url),
-            url.scheme?.lowercased() == "https" else {
-        invoke.reject("仅允许 HTTPS 中转地址")
+            let scheme = url.scheme?.lowercased() else {
+        invoke.reject("无效的网络请求地址")
         return
       }
-      var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 25)
+      let allowLocalHttp = scheme == "http" && Self.isPrivateOrLocalHost(url.host ?? "")
+      guard scheme == "https" || allowLocalHttp else {
+        invoke.reject("仅允许 HTTPS 或局域网内网 WebDAV 地址")
+        return
+      }
+      var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 30)
       req.httpMethod = method
       if let headers = args.headers {
         for (k, v) in headers {
           req.setValue(v, forHTTPHeaderField: k)
         }
       }
-      if let body = args.body, method == "POST" {
+      if let body = args.body, method == "POST" || method == "PUT" {
         req.httpBody = body.data(using: .utf8)
       }
 
-      let delegate = HttpsOnlyRedirectDelegate()
+      let delegate = NoRedirectDelegate()
       let session = URLSession(configuration: .ephemeral, delegate: delegate, delegateQueue: nil)
       let task = session.dataTask(with: req) { data, response, err in
         session.finishTasksAndInvalidate()
@@ -500,13 +506,16 @@ public class AccountSessionPlugin: Plugin {
           invoke.reject("网络请求失败: \(err.localizedDescription)")
           return
         }
-        guard let httpResp = response as? HTTPURLResponse,
-              httpResp.url?.scheme?.lowercased() == "https" else {
+        guard let httpResp = response as? HTTPURLResponse else {
+          invoke.reject("无效的 HTTP 响应")
+          return
+        }
+        if !allowLocalHttp && httpResp.url?.scheme?.lowercased() != "https" {
           invoke.reject("响应重定向到了非 HTTPS 地址")
           return
         }
         let payload = data ?? Data()
-        if payload.count > 4 * 1024 * 1024 {
+        if payload.count > 16 * 1024 * 1024 {
           invoke.reject("响应内容过大")
           return
         }
@@ -517,6 +526,30 @@ public class AccountSessionPlugin: Plugin {
     } catch {
       invoke.reject("解析网络请求参数失败")
     }
+  }
+
+  private static func isPrivateOrLocalHost(_ host: String) -> Bool {
+    let lower = host.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    if lower == "localhost" || lower.hasSuffix(".local") || lower == "127.0.0.1" || lower == "::1" || lower == "[::1]" {
+      return true
+    }
+    let parts = lower.split(separator: ".").compactMap { Int($0) }
+    guard parts.count == 4, parts.allSatisfy({ (0...255).contains($0) }) else {
+      return false
+    }
+    if parts[0] == 10 || parts[0] == 127 {
+      return true
+    }
+    if parts[0] == 192 && parts[1] == 168 {
+      return true
+    }
+    if parts[0] == 172 && (16...31).contains(parts[1]) {
+      return true
+    }
+    if parts[0] == 169 && parts[1] == 254 {
+      return true
+    }
+    return false
   }
 
   @objc public func scanQrCode(_ invoke: Invoke) {
@@ -565,6 +598,18 @@ public class AccountSessionPlugin: Plugin {
       }
     }
     return fallback
+  }
+}
+
+private final class NoRedirectDelegate: NSObject, URLSessionTaskDelegate {
+  func urlSession(
+    _ session: URLSession,
+    task: URLSessionTask,
+    willPerformHTTPRedirection response: HTTPURLResponse,
+    newRequest request: URLRequest,
+    completionHandler: @escaping (URLRequest?) -> Void
+  ) {
+    completionHandler(nil)
   }
 }
 

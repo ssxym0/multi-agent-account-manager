@@ -451,23 +451,25 @@ class AccountSessionPlugin(private val activity: Activity) : Plugin(activity) {
             var conn: HttpURLConnection? = null
             try {
                 val method = args.method.uppercase()
-                if (method !in setOf("GET", "POST", "DELETE")) {
+                if (method !in setOf("GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS")) {
                     throw IllegalArgumentException("不支持的 HTTP 方法")
                 }
                 val parsed = URL(args.url)
-                if (!parsed.protocol.equals("https", ignoreCase = true)) {
-                    throw IllegalArgumentException("仅允许 HTTPS 中转地址")
+                val allowLocalHttp =
+                    parsed.protocol.equals("http", ignoreCase = true) && isPrivateOrLocalHost(parsed.host ?: "")
+                if (!parsed.protocol.equals("https", ignoreCase = true) && !allowLocalHttp) {
+                    throw IllegalArgumentException("仅允许 HTTPS 或局域网内网 WebDAV 地址")
                 }
                 conn = (parsed.openConnection() as HttpURLConnection).apply {
                     instanceFollowRedirects = false
                     connectTimeout = 15_000
-                    readTimeout = 25_000
+                    readTimeout = 30_000
                     requestMethod = method
                     useCaches = false
                     args.headers?.forEach { (k, v) ->
                         setRequestProperty(k, v)
                     }
-                    if (args.body != null && method == "POST") {
+                    if (args.body != null && (method == "POST" || method == "PUT")) {
                         doOutput = true
                         val bytes = args.body!!.toByteArray(Charsets.UTF_8)
                         setFixedLengthStreamingMode(bytes.size)
@@ -485,7 +487,7 @@ class AccountSessionPlugin(private val activity: Activity) : Plugin(activity) {
                             val n = input.read(buf)
                             if (n <= 0) break
                             totalRead += n
-                            if (totalRead > 4 * 1024 * 1024) {
+                            if (totalRead > 16 * 1024 * 1024) {
                                 throw IllegalStateException("响应内容过大")
                             }
                             out.write(buf, 0, n)
@@ -506,6 +508,22 @@ class AccountSessionPlugin(private val activity: Activity) : Plugin(activity) {
                 conn?.disconnect()
             }
         }
+    }
+
+    private fun isPrivateOrLocalHost(host: String): Boolean {
+        val lower = host.trim().lowercase()
+        if (lower == "localhost" || lower.endsWith(".local") || lower == "127.0.0.1" || lower == "::1" || lower == "[::1]") {
+            return true
+        }
+        val parts = lower.split(".").mapNotNull { it.toIntOrNull() }
+        if (parts.size != 4 || parts.any { it !in 0..255 }) {
+            return false
+        }
+        if (parts[0] == 10 || parts[0] == 127) return true
+        if (parts[0] == 192 && parts[1] == 168) return true
+        if (parts[0] == 172 && parts[1] in 16..31) return true
+        if (parts[0] == 169 && parts[1] == 254) return true
+        return false
     }
 
     @Command

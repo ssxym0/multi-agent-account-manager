@@ -70,6 +70,12 @@ if "        NSCameraUsageDescription:" not in text:
         "        NSLocalNetworkUsageDescription: 用于局域网多端加密同步账号与登录态\n        NSCameraUsageDescription: 用于扫描局域网同步二维码，快速导入账号与登录态\n",
         1,
     )
+if "        NSAppTransportSecurity:" not in text:
+    text = text.replace(
+        "        LSRequiresIPhoneOS: true\n",
+        "        LSRequiresIPhoneOS: true\n        NSAppTransportSecurity:\n          NSAllowsLocalNetworking: true\n",
+        1,
+    )
 
 text = text.replace("      - path: LaunchScreen.storyboard\n", "")
 text = text.replace("        UILaunchStoryboardName: LaunchScreen\n", "        UILaunchScreen: {}\n")

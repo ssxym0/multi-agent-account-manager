@@ -53,6 +53,9 @@
     "allow-start-relay-sync-share",
     "allow-stop-lan-sync-share",
     "allow-pull-lan-sync-share",
-    "allow-scan-sync-qr-code"
+    "allow-scan-sync-qr-code",
+    "allow-test-webdav-sync",
+    "allow-push-webdav-sync",
+    "allow-pull-webdav-sync"
   ]
 }

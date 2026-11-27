@@ -20,6 +20,7 @@
 - **多端端到端加密同步（四端互通）**：
   - **局域网直传扫码**：自动过滤代理 TUN / 虚拟网卡并识别真实物理局域网 IP，使用 `AES-256-GCM` 端到端加密，3 分钟或最多 3 次拉取后自动关闭；iOS / Android 支持原生相机扫码一键拉取合并，无需手动复制。
   - **可选 Cloudflare 零知识加密中转通道（默认关闭）**：跨网或开启代理不便局域网直连时可手动开启（默认接入 `https://sync.ldjx7.qzz.io`，也可自建 [`relay-worker/`](relay-worker)）；每次传输本地随机生成一次性 256-bit 密钥且仅含于二维码/同步串中，不收集用户数据，服务端仅暂存密文、无法解密，3 分钟或拉取完成后立即销毁。
+  - **WebDAV 端到端加密云同步**：支持坚果云、Nextcloud、AList / OpenList、NAS 等标准 WebDAV 服务（公网强制 HTTPS，局域网内网支持 HTTP）；本地使用 `AES-256-GCM` 端到端加密后上传，加密口令不保存也不上传，支持连接测试与增量拉取合并。
   - **`.maam` 加密备份文件**：支持导出与导入账号配置、代理、时区、群聊及隔离容器 Cookie 登录态；落盘采用只增不删的增量合并，保留本地已有数据。
 - **Cookie 导入登录与邮箱识别（全平台）**：
   - 在「新增账号」弹窗或「账号设置」弹窗中粘贴 **JSON 数组**、**Netscape `cookies.txt`** 或 **HTTP `Cookie:` 请求头** 即可导入对应账号的独立隔离容器（macOS / Windows / Android / iOS 均支持）。
@@ -63,7 +64,10 @@
    - 跨网络或代理限制局域网直连时，可在发送端手动勾选 **「启用官网 / Cloudflare 加密中转通道」**（内置默认通道 `https://sync.ldjx7.qzz.io`，也可填写自建 Worker 地址）。
    - 每次同步均在本地随机生成一次性 256-bit 密钥做 `AES-256-GCM` 端到端加密，密钥仅包含在二维码/同步串 `#` 片段中且绝不上传服务端；中转服务端不收集用户数据、无法解密密文，到达有效期（3 分钟）或拉取上限后自动彻底销毁。
    - 如需自建中转服务，可在 `relay-worker/` 目录执行 `npx wrangler deploy` 部署 Cloudflare Workers + Durable Objects 实例。
-3. **`.maam` 加密备份文件**：
+3. **WebDAV 云同步**：
+   - 切换至 **「WebDAV 云同步」** 标签页，填写 WebDAV 地址（如坚果云建议指定子目录 `https://dav.jianguoyun.com/dav/diehao/`）、用户名与应用密码，可先点击 **「测试连接」** 校验目录与权限。
+   - 输入至少 4 位端到端加密口令（两端需一致，本地不持久化保存且不上传），点击 **「加密上传到 WebDAV」** 备份密文，或在目标设备点击 **「从 WebDAV 拉取并合并」** 完成增量同步。
+4. **`.maam` 加密备份文件**：
    - 切换至 **「加密备份文件」** 标签页，设置口令即可导出/导入 `.maam` 加密包。合并时按账号、群聊、外部 Agent 增量写入，不会删除接收端原有数据。
 
 ### 4. 同代理保活与频率设置（桌面端）
@@ -71,6 +75,55 @@
 1. 点击左下角 **「设置」**，可按需配置 **「同代理仅保活当前账号（防多号同 IP 限流）」**（默认开启）与 **「后台静默保活 / 额度检测间隔（分钟）」**（默认 15 分钟，支持 `5 / 15 / 30 / 仅手动(0)`）。
 2. 当多个 Muse 账号共用同一代理或均走系统默认代理时，保持默认开启可避免多实例并发请求触发 IP 频控；若已为各账号分别配置独立出口代理，可关闭隔离开关以恢复全部后台预热。
 3. iOS / Android 移动端每次仅单开当前账号会话，返回即关闭，无后台保活与定时轮询，无需额外配置。
+
+### 5. 为每个账号单独配置代理（以 Windows Clash Verge 为例）
+
+1. **添加全局扩展脚本**：打开 **Clash Verge**，进入左侧 **「订阅」** 页面，找到 **「全局扩展脚本」**，右键选择 **「编辑文件」**，写入以下脚本：
+
+   <p align="center">
+     <img src="docs/screenshots/clash-verge-script.jpg" alt="Clash Verge 全局扩展脚本右键编辑" width="76%" />
+   </p>
+
+   ```js
+   function main(config) {
+     const count = 5;          // 代理数量可自行更改
+     const startPort = 17891;  // 起始端口号可自行更改
+     const allNames = (config.proxies || []).map(p => p.name);
+
+     const accGroups = [];
+     const accListeners = [];
+     for (let i = 1; i <= count; i++) {
+       const name = `账号${i}出口`;
+       accGroups.push({ name, type: "select", proxies: [...allNames] });
+       accListeners.push({
+         name: `acc${i}`,
+         type: "http",
+         port: startPort + i - 1,
+         listen: "127.0.0.1",
+         proxy: name,
+       });
+     }
+
+     config["proxy-groups"] = [...accGroups, ...(config["proxy-groups"] || [])];
+     config.listeners = [...(config.listeners || []), ...accListeners];
+     return config;
+   }
+   ```
+
+2. **为每个出口分组选择节点**：保存并启用脚本后，在 Clash Verge 左侧 **「代理」** 页面会出现 `账号1出口`、`账号2出口` 等策略组，分别为每个分组选择不同的代理节点。
+
+   <p align="center">
+     <img src="docs/screenshots/clash-verge-groups.jpg" alt="Clash Verge 为每个账号策略组选择不同节点" width="76%" />
+   </p>
+3. **在叠号中绑定端口并测试**：打开叠号对应账号的 **「账号设置」**，在 **「HTTP CONNECT 代理」** 中填入对应本地代理地址（如 `http://127.0.0.1:17891` ～ `http://127.0.0.1:17895`，每个端口对应一个出口节点），点击 **「测试连接」** 显示成功即可；也可按需在下方搭配 **「自定义时区」**。
+
+> **平台补充说明**：Android 由于系统机制限制，暂不支持为每个账号单独配置代理；macOS / iOS 使用 Shadowrocket（小火箭）无法按端口分流，改用支持多 `listeners` 入站的 Clash 类客户端配置逻辑基本相同。
+
+<p align="center">
+  <img src="docs/screenshots/proxy-muse1.jpg" alt="Muse1 独立代理配置" width="240" />
+  <img src="docs/screenshots/proxy-muse2.jpg" alt="Muse2 独立代理配置" width="240" />
+  <img src="docs/screenshots/proxy-muse3.jpg" alt="Muse3 独立代理配置" width="240" />
+</p>
 
 ---
 
@@ -183,8 +236,8 @@
   2. 提交并推送 `v*` 标签（GitHub Actions 将自动编译四端安装包（macOS / Windows / Android / iOS）、生成 `latest.json` 并创建 Release）：
 
      ```bash
-     git tag v0.2.0
-     git push origin v0.2.0
+     git tag v0.2.1
+     git push origin v0.2.1
      ```
 
 ---

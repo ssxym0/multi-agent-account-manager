@@ -2224,7 +2224,7 @@ dependencies = [
 
 [[package]]
 name = "multi-agent-account-manager"
-version = "0.2.0"
+version = "0.2.4"
 dependencies = [
  "aes-gcm",
  "arboard",

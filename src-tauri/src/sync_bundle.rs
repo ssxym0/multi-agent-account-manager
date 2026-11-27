@@ -980,6 +980,295 @@ pub async fn delete_relay_drop(
   }
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebDavTestResult {
+  pub ok: bool,
+  pub remote_url: String,
+  pub file_exists: bool,
+  pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebDavPushResult {
+  pub remote_url: String,
+  pub account_count: usize,
+  pub cookie_account_count: usize,
+  pub size_bytes: usize,
+}
+
+fn is_local_or_private_host(host: &str) -> bool {
+  let clean = host.trim().trim_start_matches('[').trim_end_matches(']');
+  let lower = clean.to_ascii_lowercase();
+  if lower == "localhost" || lower.ends_with(".local") {
+    return true;
+  }
+  if let Ok(ip) = lower.parse::<IpAddr>() {
+    return match ip {
+      IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+      IpAddr::V6(v6) => v6.is_loopback(),
+    };
+  }
+  false
+}
+
+pub fn normalize_webdav_target(
+  raw_url: &str,
+  raw_filename: Option<&str>,
+) -> Result<(String, String, String), String> {
+  let trimmed_url = raw_url.trim();
+  if trimmed_url.is_empty() {
+    return Err("请填写 WebDAV 服务地址（如 https://dav.jianguoyun.com/dav/）".to_string());
+  }
+  let mut parsed = Url::parse(trimmed_url).map_err(|_| "WebDAV 服务地址格式无效".to_string())?;
+  let scheme = parsed.scheme().to_ascii_lowercase();
+  let host = parsed
+    .host_str()
+    .map(str::trim)
+    .filter(|h| !h.is_empty())
+    .ok_or_else(|| "WebDAV 服务地址缺少域名或主机".to_string())?
+    .to_string();
+  let allow_http = scheme == "http" && is_local_or_private_host(&host);
+  if scheme != "https" && !allow_http {
+    return Err("公网 WebDAV 仅允许使用 HTTPS 地址".to_string());
+  }
+  if !parsed.username().is_empty() || parsed.password().is_some() {
+    return Err("请将 WebDAV 用户名和密码填写到下方专用输入框，不要写在 URL 中".to_string());
+  }
+  if parsed.query().is_some() || parsed.fragment().is_some() {
+    return Err("WebDAV 地址不应包含查询参数或片段".to_string());
+  }
+
+  let raw_file = raw_filename.unwrap_or("").trim();
+  let mut clean_filename = if raw_file.is_empty() {
+    "maam-sync.maam".to_string()
+  } else {
+    raw_file.trim_matches('/').to_string()
+  };
+  let parts: Vec<&str> = clean_filename.split('/').collect();
+  if parts.is_empty() || parts.iter().any(|p| p.is_empty() || *p == "." || *p == "..") {
+    return Err("WebDAV 同步文件名格式无效".to_string());
+  }
+  clean_filename = parts.join("/");
+
+  let path_str = parsed.path().trim_end_matches('/').to_string();
+  if path_str.to_ascii_lowercase().ends_with(".maam")
+    && (raw_file.is_empty() || raw_file.eq_ignore_ascii_case("maam-sync.maam"))
+  {
+    if let Some((parent, leaf)) = path_str.rsplit_once('/') {
+      parsed.set_path(&format!("{}/", parent));
+      clean_filename = leaf.to_string();
+    }
+  } else {
+    let dir_path = if path_str.is_empty() {
+      "/".to_string()
+    } else {
+      format!("{path_str}/")
+    };
+    parsed.set_path(&dir_path);
+  }
+
+  let base_dir_url = parsed.as_str().to_string();
+  let full_url = parsed
+    .join(&clean_filename)
+    .map_err(|_| "拼接 WebDAV 文件地址失败".to_string())?
+    .to_string();
+  Ok((base_dir_url, clean_filename, full_url))
+}
+
+fn build_webdav_headers(
+  username: &str,
+  password: &str,
+  content_type: Option<&str>,
+) -> HashMap<String, String> {
+  let mut headers = HashMap::new();
+  if !username.trim().is_empty() || !password.is_empty() {
+    let creds = format!("{}:{}", username.trim(), password);
+    headers.insert("Authorization".to_string(), format!("Basic {}", B64.encode(creds)));
+  }
+  if let Some(ct) = content_type {
+    headers.insert("Content-Type".to_string(), ct.to_string());
+  }
+  headers
+}
+
+async fn webdav_http_request(
+  app: &tauri::AppHandle,
+  method: &str,
+  url: &str,
+  headers: HashMap<String, String>,
+  body: Option<String>,
+) -> Result<(u16, String), String> {
+  #[cfg(desktop)]
+  {
+    let _ = app;
+    let client = reqwest::Client::builder()
+      .user_agent("MultiAgentAccountManager/0.2")
+      .redirect(reqwest::redirect::Policy::none())
+      .connect_timeout(Duration::from_secs(15))
+      .timeout(Duration::from_secs(30))
+      .build()
+      .map_err(|e| format!("初始化 WebDAV 请求失败: {e}"))?;
+    let http_method = reqwest::Method::from_bytes(method.as_bytes())
+      .map_err(|_| "不支持的 HTTP 方法".to_string())?;
+    let mut req = client.request(http_method, url);
+    for (k, v) in headers {
+      req = req.header(&k, v);
+    }
+    if let Some(payload) = body {
+      req = req.body(payload);
+    }
+    let resp = req
+      .send()
+      .await
+      .map_err(|e| format!("连接 WebDAV 服务失败: {e}"))?;
+    let status = resp.status().as_u16();
+    let text = resp
+      .text()
+      .await
+      .map_err(|e| format!("读取 WebDAV 响应失败: {e}"))?;
+    Ok((status, text))
+  }
+  #[cfg(mobile)]
+  {
+    let resp = crate::platform::mobile::http_request(app, method, url, headers, body).await?;
+    Ok((resp.status, resp.body))
+  }
+}
+
+pub async fn test_webdav_connection(
+  app: &tauri::AppHandle,
+  raw_url: &str,
+  username: &str,
+  password: &str,
+  raw_filename: Option<&str>,
+) -> Result<WebDavTestResult, String> {
+  let (base_dir_url, _, full_url) = normalize_webdav_target(raw_url, raw_filename)?;
+  let headers = build_webdav_headers(username, password, None);
+  #[cfg(not(target_os = "android"))]
+  let status = {
+    let mut propfind_headers = headers.clone();
+    propfind_headers.insert("Depth".to_string(), "0".to_string());
+    let (st, _) =
+      webdav_http_request(app, "PROPFIND", &base_dir_url, propfind_headers, None).await?;
+    if st == 405 || st == 501 {
+      let (opt_st, _) =
+        webdav_http_request(app, "OPTIONS", &base_dir_url, headers.clone(), None).await?;
+      if opt_st == 405 {
+        webdav_http_request(app, "HEAD", &base_dir_url, headers.clone(), None).await?.0
+      } else {
+        opt_st
+      }
+    } else {
+      st
+    }
+  };
+  #[cfg(target_os = "android")]
+  let status = {
+    let (opt_st, _) =
+      webdav_http_request(app, "OPTIONS", &base_dir_url, headers.clone(), None).await?;
+    if opt_st == 405 {
+      webdav_http_request(app, "HEAD", &base_dir_url, headers.clone(), None).await?.0
+    } else {
+      opt_st
+    }
+  };
+  if status == 401 || status == 403 {
+    return Err("WebDAV 认证失败，请检查账号或应用密码".to_string());
+  }
+  if status == 404 {
+    return Err("WebDAV 目录不存在（HTTP 404），请确认路径已在网盘中创建".to_string());
+  }
+  if !(200..300).contains(&status) {
+    return Err(format!("WebDAV 服务异常（HTTP {status}）"));
+  }
+  let (head_status, _) = webdav_http_request(app, "HEAD", &full_url, headers, None).await?;
+  if head_status == 401 {
+    return Err("WebDAV 认证失败，请检查账号或应用密码".to_string());
+  }
+  if head_status == 403 {
+    return Err("WebDAV 目标目录无访问权限（HTTP 403），如使用坚果云请指定子目录（例如 /dav/diehao/）".to_string());
+  }
+  let file_exists = (200..300).contains(&head_status);
+  let message = if file_exists {
+    "WebDAV 连接成功，已检测到远端同步备份文件".to_string()
+  } else {
+    "WebDAV 连接成功（远端尚无备份文件，可点击上传创建）".to_string()
+  };
+  Ok(WebDavTestResult {
+    ok: true,
+    remote_url: full_url,
+    file_exists,
+    message,
+  })
+}
+
+pub async fn upload_webdav_bundle(
+  app: &tauri::AppHandle,
+  raw_url: &str,
+  username: &str,
+  password: &str,
+  raw_filename: Option<&str>,
+  encrypted_json: String,
+) -> Result<String, String> {
+  let (base_dir_url, clean_filename, full_url) = normalize_webdav_target(raw_url, raw_filename)?;
+  let headers = build_webdav_headers(username, password, Some("application/json; charset=utf-8"));
+  #[cfg_attr(target_os = "android", allow(unused_mut))]
+  let (mut status, _) =
+    webdav_http_request(app, "PUT", &full_url, headers.clone(), Some(encrypted_json.clone())).await?;
+  #[cfg(not(target_os = "android"))]
+  if status == 409 || status == 404 {
+    let mkcol_headers = build_webdav_headers(username, password, None);
+    let _ = webdav_http_request(app, "MKCOL", &base_dir_url, mkcol_headers.clone(), None).await;
+    if let Some((sub_parent, _)) = clean_filename.rsplit_once('/') {
+      if let Ok(base_parsed) = Url::parse(&base_dir_url) {
+        if let Ok(sub_url) = base_parsed.join(&format!("{sub_parent}/")) {
+          let _ = webdav_http_request(app, "MKCOL", sub_url.as_str(), mkcol_headers, None).await;
+        }
+      }
+    }
+    (status, _) = webdav_http_request(app, "PUT", &full_url, headers, Some(encrypted_json)).await?;
+  }
+  #[cfg(target_os = "android")]
+  let _ = (base_dir_url, clean_filename);
+  match status {
+    200..=299 => Ok(full_url),
+    401 | 403 => Err("WebDAV 认证失败，请检查账号或应用密码".to_string()),
+    404 | 409 => Err(format!(
+      "远端目录不存在（HTTP {status}），请先在 WebDAV 网盘中创建对应目录"
+    )),
+    _ => Err(format!("上传到 WebDAV 失败（HTTP {status}）")),
+  }
+}
+
+pub async fn download_webdav_bundle(
+  app: &tauri::AppHandle,
+  raw_url: &str,
+  username: &str,
+  password: &str,
+  raw_filename: Option<&str>,
+) -> Result<String, String> {
+  let (_, _, full_url) = normalize_webdav_target(raw_url, raw_filename)?;
+  let headers = build_webdav_headers(username, password, None);
+  let (status, body) = webdav_http_request(app, "GET", &full_url, headers, None).await?;
+  match status {
+    200..=299 => {
+      let trimmed = body.trim().to_string();
+      if trimmed.is_empty() {
+        return Err("远端 WebDAV 备份文件为空".to_string());
+      }
+      if trimmed.len() > MAX_SYNC_BODY_BYTES {
+        return Err("远端 WebDAV 备份文件体积超出限制".to_string());
+      }
+      Ok(trimmed)
+    }
+    401 | 403 => Err("WebDAV 认证失败，请检查账号或应用密码".to_string()),
+    404 => Err("远端尚无备份文件，请先在源设备点击「加密上传到 WebDAV」".to_string()),
+    _ => Err(format!("从 WebDAV 拉取失败（HTTP {status}）")),
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;

@@ -19,12 +19,20 @@ export interface ProviderInfo {
   verifiedMethods: string[];
 }
 
+export interface WebDavConfig {
+  url: string;
+  username: string;
+  password: string;
+  filename: string;
+}
+
 export interface AppSettings {
   minimizeToTray: boolean;
   globalShortcut: string;
   autoApprove: boolean;
   isolateSameProxyKeepAlive: boolean;
   silentSyncIntervalMins: number;
+  webdav?: WebDavConfig;
 }
 
 export interface ProxyTestResult {
@@ -268,4 +276,18 @@ export interface LanSyncShareInfo {
 export interface ScanQrResult {
   content: string;
   cancelled: boolean;
+}
+
+export interface WebDavTestResult {
+  ok: boolean;
+  remoteUrl: string;
+  fileExists: boolean;
+  message: string;
+}
+
+export interface WebDavPushResult {
+  remoteUrl: string;
+  accountCount: number;
+  cookieAccountCount: number;
+  sizeBytes: number;
 }

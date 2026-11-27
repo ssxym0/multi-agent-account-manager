@@ -15,7 +15,9 @@ use site_adapters::SiteAdaptersSnapshot;
 use storage::{
   AccountKey, ExternalAgentKind, GroupMemberRole, GroupSharedSkill, GroupWorkflowMode,
 };
-use sync_bundle::{ExportSyncBundleResponse, LanSyncShareInfo};
+use sync_bundle::{
+  ExportSyncBundleResponse, LanSyncShareInfo, WebDavPushResult, WebDavTestResult,
+};
 #[cfg(desktop)]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -273,11 +275,20 @@ async fn export_sync_bundle(
   mgr: State<'_, Arc<SessionManager>>,
   webview: tauri::Webview,
   passphrase: String,
+  include_proxy: Option<bool>,
+  account_keys: Option<Vec<String>>,
 ) -> Result<ExportSyncBundleResponse, String> {
   if webview.label() != "manager" {
     return Err("仅账号管理页可以导出同步备份".to_string());
   }
-  mgr.export_sync_bundle(&app, passphrase).await
+  mgr
+    .export_sync_bundle(
+      &app,
+      passphrase,
+      include_proxy.unwrap_or(false),
+      account_keys,
+    )
+    .await
 }
 
 #[tauri::command]
@@ -287,11 +298,14 @@ async fn import_sync_bundle(
   webview: tauri::Webview,
   bundle_json: String,
   passphrase: String,
+  include_proxy: Option<bool>,
 ) -> Result<ImportSyncBundleResponse, String> {
   if webview.label() != "manager" {
     return Err("仅账号管理页可以导入同步备份".to_string());
   }
-  mgr.import_sync_bundle(&app, bundle_json, passphrase).await
+  mgr
+    .import_sync_bundle(&app, bundle_json, passphrase, include_proxy.unwrap_or(false))
+    .await
 }
 
 #[tauri::command]
@@ -300,11 +314,20 @@ async fn start_lan_sync_share(
   mgr: State<'_, Arc<SessionManager>>,
   webview: tauri::Webview,
   passphrase: Option<String>,
+  include_proxy: Option<bool>,
+  account_keys: Option<Vec<String>>,
 ) -> Result<LanSyncShareInfo, String> {
   if webview.label() != "manager" {
     return Err("仅账号管理页可以开启局域网同步".to_string());
   }
-  mgr.start_lan_sync_share(&app, passphrase).await
+  mgr
+    .start_lan_sync_share(
+      &app,
+      passphrase,
+      include_proxy.unwrap_or(false),
+      account_keys,
+    )
+    .await
 }
 
 #[tauri::command]
@@ -313,11 +336,20 @@ async fn start_relay_sync_share(
   mgr: State<'_, Arc<SessionManager>>,
   webview: tauri::Webview,
   relay_url: Option<String>,
+  include_proxy: Option<bool>,
+  account_keys: Option<Vec<String>>,
 ) -> Result<LanSyncShareInfo, String> {
   if webview.label() != "manager" {
     return Err("仅账号管理页可以开启加密中转同步".to_string());
   }
-  mgr.start_relay_sync_share(&app, relay_url).await
+  mgr
+    .start_relay_sync_share(
+      &app,
+      relay_url,
+      include_proxy.unwrap_or(false),
+      account_keys,
+    )
+    .await
 }
 
 #[tauri::command]
@@ -339,11 +371,14 @@ async fn pull_lan_sync_share(
   webview: tauri::Webview,
   address: String,
   passphrase: String,
+  include_proxy: Option<bool>,
 ) -> Result<ImportSyncBundleResponse, String> {
   if webview.label() != "manager" {
     return Err("仅账号管理页可以拉取局域网同步".to_string());
   }
-  mgr.pull_lan_sync_share(&app, address, passphrase).await
+  mgr
+    .pull_lan_sync_share(&app, address, passphrase, include_proxy.unwrap_or(false))
+    .await
 }
 
 #[tauri::command]
@@ -356,6 +391,82 @@ async fn scan_sync_qr_code(
     return Err("仅账号管理页可以调用扫码同步".to_string());
   }
   mgr.scan_sync_qr_code(&app).await
+}
+
+#[tauri::command]
+async fn test_webdav_sync(
+  app: AppHandle,
+  mgr: State<'_, Arc<SessionManager>>,
+  webview: tauri::Webview,
+  url: String,
+  username: String,
+  password: String,
+  filename: Option<String>,
+) -> Result<WebDavTestResult, String> {
+  if webview.label() != "manager" {
+    return Err("仅账号管理页可以测试 WebDAV 同步".to_string());
+  }
+  mgr
+    .test_webdav_sync(&app, url, username, password, filename)
+    .await
+}
+
+#[tauri::command]
+async fn push_webdav_sync(
+  app: AppHandle,
+  mgr: State<'_, Arc<SessionManager>>,
+  webview: tauri::Webview,
+  url: String,
+  username: String,
+  password: String,
+  filename: Option<String>,
+  passphrase: String,
+  include_proxy: Option<bool>,
+  account_keys: Option<Vec<String>>,
+) -> Result<WebDavPushResult, String> {
+  if webview.label() != "manager" {
+    return Err("仅账号管理页可以上传 WebDAV 同步".to_string());
+  }
+  mgr
+    .push_webdav_sync(
+      &app,
+      url,
+      username,
+      password,
+      filename,
+      passphrase,
+      include_proxy.unwrap_or(false),
+      account_keys,
+    )
+    .await
+}
+
+#[tauri::command]
+async fn pull_webdav_sync(
+  app: AppHandle,
+  mgr: State<'_, Arc<SessionManager>>,
+  webview: tauri::Webview,
+  url: String,
+  username: String,
+  password: String,
+  filename: Option<String>,
+  passphrase: String,
+  include_proxy: Option<bool>,
+) -> Result<ImportSyncBundleResponse, String> {
+  if webview.label() != "manager" {
+    return Err("仅账号管理页可以拉取 WebDAV 同步".to_string());
+  }
+  mgr
+    .pull_webdav_sync(
+      &app,
+      url,
+      username,
+      password,
+      filename,
+      passphrase,
+      include_proxy.unwrap_or(false),
+    )
+    .await
 }
 
 #[tauri::command]
@@ -805,6 +916,9 @@ pub fn run() {
       stop_lan_sync_share,
       pull_lan_sync_share,
       scan_sync_qr_code,
+      test_webdav_sync,
+      push_webdav_sync,
+      pull_webdav_sync,
     ])
     .build(tauri::generate_context!())
     .expect("error while building tauri application")

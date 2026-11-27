@@ -1271,7 +1271,7 @@ const IDENTITY_PROBE_JS: &str = r#"(() => {
     if (document.readyState === 'loading') {
       return makeLoading();
     }
-    const loginInputs = document.querySelectorAll('input[type="email"], input[type="password"], input[autocomplete="one-time-code"], input[placeholder*="邮箱"], input[placeholder*="手机"], input[placeholder*="email" i], input[placeholder*="phone" i]');
+    const loginInputs = document.querySelectorAll('input[type="email"], input[type="password"], input[type="tel"], input[autocomplete="one-time-code"], input[autocomplete*="email" i], input[inputmode="email"], input[inputmode="numeric"], input[name*="email" i], input[name*="phone" i], input[name*="code" i], input[name*="otp" i], input[id*="email" i], input[id*="code" i], input[id*="otp" i], input[maxlength="1"], input[maxlength="6"], input[placeholder*="邮箱"], input[placeholder*="手机"], input[placeholder*="验证码"], input[placeholder*="email" i], input[placeholder*="phone" i], input[placeholder*="code" i], input[aria-label*="邮箱"], input[aria-label*="验证码"], input[aria-label*="email" i], input[aria-label*="code" i]');
     const hasVisibleLoginInput = () => {
       for (const inp of loginInputs) {
         if (inp.disabled || inp.readOnly) continue;
@@ -1280,6 +1280,8 @@ const IDENTITY_PROBE_JS: &str = r#"(() => {
       }
       return false;
     };
+    const activeEl = document.activeElement;
+    const hasFocusedInput = Boolean(activeEl && activeEl.tagName === 'INPUT' && !activeEl.disabled && !activeEl.readOnly);
     const hasChatComposer = Array.from(document.querySelectorAll('textarea, [contenteditable="true"]')).some((el) => {
       if (el.disabled || el.readOnly) return false;
       const r = el.getBoundingClientRect();
@@ -1332,11 +1334,11 @@ const IDENTITY_PROBE_JS: &str = r#"(() => {
     if (/^\/(login|signin|signup|auth)\b/.test(path)) {
       return makeLoggedOut(false);
     }
-    if (!hasChatComposer && !/^\/(settings|profile|account)\b/.test(path) && hasVisibleLoginInput()) {
+    if (!hasChatComposer && !/^\/(settings|profile|account)\b/.test(path) && (hasVisibleLoginInput() || hasFocusedInput)) {
       return makeLoggedOut(false);
     }
     const bodyText = (document.body && document.body.innerText) || '';
-    if (!hasChatComposer && /登录或创建账户|Log in or sign up|Sign in to|登录以继续|通过 Google 继续|Continue with Google|通过 Apple 继续|Continue with Apple/i.test(bodyText)) {
+    if (!hasChatComposer && /登录或创建账户|登录\s*Muse|Log in to Muse|使用其他账户|Use another account|Log in or sign up|Sign in to|登录以继续|通过 Google 继续|Continue with Google|通过 Apple 继续|Continue with Apple|Continue with email|使用邮箱继续|输入验证码|验证码|verification code|enter the code|enter code|check your email|检查你的邮箱|手机号或邮箱/i.test(bodyText)) {
       return makeLoggedOut(false);
     }
     if (host.endsWith('hark.com') && bodyText.trim() === 'Unauthorized') {
@@ -1358,7 +1360,7 @@ const IDENTITY_PROBE_JS: &str = r#"(() => {
     if (!hasChatComposer) {
       const ac = window.__maamAuthCheck;
       if (ac && ac.status === 'invalid') {
-        return makeLoggedOut(true);
+        return makeLoggedOut(!(hasVisibleLoginInput() || hasFocusedInput || Boolean(typed || phone)));
       }
       const hasErrorActionBtn = Array.from(document.querySelectorAll('button, a, [role="button"]')).some((el) => {
         if (!el || !el.isConnected) return false;
@@ -1392,7 +1394,7 @@ const IDENTITY_PROBE_JS: &str = r#"(() => {
         }
         return makePageError(isDegradedMuseSettings ? '登录态异常，请退出或清理重登' : '页面出错，请检查代理或清理重登');
       }
-      if (!/^\/(settings|profile|account)\b/.test(path) && (!ac || ac.status === 'unknown') && (!ac || ac.inflight || !ac.checkedAt)) {
+      if (!/^\/(settings|profile|account)\b/.test(path) && (!ac || ac.status !== 'ok')) {
         return makeLoading();
       }
     }
@@ -3782,35 +3784,7 @@ pub struct AccountPageError {
   pub message: String,
 }
 
-/// 把被内嵌页拦截的站外链接交给系统浏览器打开；同一链接 3 秒内只打开一次，
-/// 避免重定向链或重复触发刷出一堆浏览器标签页。
-fn open_external_link_once(raw_url: &str) {
-  if !(raw_url.starts_with("https://") || raw_url.starts_with("http://")) {
-    return;
-  }
-  static LAST_OPEN: std::sync::Mutex<Option<(String, std::time::Instant)>> =
-    std::sync::Mutex::new(None);
-  {
-    let mut guard = match LAST_OPEN.lock() {
-      Ok(g) => g,
-      Err(poisoned) => poisoned.into_inner(),
-    };
-    if let Some((last_url, last_at)) = guard.as_ref() {
-      if last_url == raw_url && last_at.elapsed() < std::time::Duration::from_secs(3) {
-        return;
-      }
-    }
-    *guard = Some((raw_url.to_string(), std::time::Instant::now()));
-  }
-  #[cfg(desktop)]
-  {
-    let _ = platform::open_external_browser(raw_url);
-  }
-}
-
-/// Meta 系外链跳转壳（l.meta.ai / l.facebook.com / l.instagram.com）：真实目标在
-/// u 参数里。壳域名本身在服务商白名单内，若不拆壳，站外链接会先进「登录认证」
-/// 弹窗、再在弹窗里被拦截成白屏。
+/// 本地补丁：把 l.meta.ai 等 Meta 跳转壳链接拆出真实目标（u 参数）。
 fn unwrap_link_shim(url: &Url) -> Option<Url> {
   let host = url.host_str()?.to_ascii_lowercase();
   if !matches!(
@@ -3819,13 +3793,36 @@ fn unwrap_link_shim(url: &Url) -> Option<Url> {
   ) {
     return None;
   }
-  let target = url
+  let raw = url
     .query_pairs()
-    .find(|(key, _)| key == "u")
-    .map(|(_, value)| value.into_owned())?;
-  Url::parse(&target)
-    .ok()
-    .filter(|u| u.scheme() == "https" || u.scheme() == "http")
+    .find(|(k, _)| k == "u")
+    .map(|(_, v)| v.into_owned())?;
+  let target = Url::parse(&raw).ok()?;
+  if matches!(target.scheme(), "http" | "https") {
+    Some(target)
+  } else {
+    None
+  }
+}
+
+/// 本地补丁：站外链接改用系统默认浏览器打开（仅 http/https；同一链接 3 秒内只拉起一次，防导航回调重复触发刷屏）。
+fn open_external_link_once(url: &Url) {
+  if !matches!(url.scheme(), "http" | "https") {
+    return;
+  }
+  static LAST_OPEN: std::sync::Mutex<Option<(String, std::time::Instant)>> =
+    std::sync::Mutex::new(None);
+  let now = std::time::Instant::now();
+  if let Ok(mut guard) = LAST_OPEN.lock() {
+    if let Some((last_url, last_at)) = guard.as_ref() {
+      if last_url == url.as_str() && now.duration_since(*last_at).as_secs() < 3 {
+        return;
+      }
+    }
+    *guard = Some((url.as_str().to_string(), now));
+  }
+  let target = unwrap_link_shim(url).unwrap_or_else(|| url.clone());
+  crate::platform::open_external_browser(target.as_str());
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -6201,13 +6198,15 @@ impl SessionManager {
   async fn build_sync_bundle_payload(
     &self,
     app: &AppHandle,
+    include_proxy: bool,
+    account_keys: Option<&[String]>,
   ) -> Result<(crate::sync_bundle::SyncBundlePayload, usize), String> {
     let (accounts, group_chats, external_agents) = {
       let locked = self.inner.lock().await;
       if !locked.conflicts.is_empty() {
         return Err("存在 UUID 归属冲突，请先处理冲突后再导出".to_string());
       }
-      let accounts = locked
+      let all_accounts = locked
         .store
         .accounts
         .iter()
@@ -6220,9 +6219,68 @@ impl SessionManager {
         })
         .cloned()
         .collect::<Vec<_>>();
+      let total_count = all_accounts.len();
+      let selected_set = account_keys.map(|keys| {
+        keys
+          .iter()
+          .map(|k| k.trim().to_ascii_lowercase())
+          .collect::<HashSet<String>>()
+      });
+      let accounts = all_accounts
+        .into_iter()
+        .filter(|a| {
+          if let Some(ref set) = selected_set {
+            let key = format!(
+              "{}:{}",
+              a.provider_id.as_str().to_ascii_lowercase(),
+              a.uuid.to_ascii_lowercase()
+            );
+            set.contains(&key)
+          } else {
+            true
+          }
+        })
+        .map(|mut cloned| {
+          if !include_proxy {
+            cloned.proxy_url = None;
+          }
+          cloned
+        })
+        .collect::<Vec<_>>();
+      if selected_set.is_some() && total_count > 0 && accounts.is_empty() {
+        return Err("请至少选择一个要同步的账号".to_string());
+      }
+      let group_chats = if accounts.len() < total_count {
+        let kept_keys = accounts
+          .iter()
+          .map(|a| (a.provider_id.clone(), a.uuid.to_ascii_lowercase()))
+          .collect::<HashSet<(ProviderId, String)>>();
+        locked
+          .store
+          .group_chats
+          .iter()
+          .cloned()
+          .filter_map(|mut grp| {
+            let member_kept = |m: &AccountKey| -> bool {
+              m.provider_id.is_external()
+                || kept_keys.contains(&(m.provider_id.clone(), m.uuid.to_ascii_lowercase()))
+            };
+            grp.members.retain(&member_kept);
+            grp.member_roles.retain(|r| member_kept(&r.member));
+            grp.thread_bindings.retain(|tb| member_kept(&tb.member));
+            if grp.members.iter().any(|m| !m.provider_id.is_external()) {
+              Some(grp)
+            } else {
+              None
+            }
+          })
+          .collect::<Vec<_>>()
+      } else {
+        locked.store.group_chats.clone()
+      };
       (
         accounts,
-        locked.store.group_chats.clone(),
+        group_chats,
         locked.store.external_agents.clone(),
       )
     };
@@ -6330,6 +6388,7 @@ impl SessionManager {
     self: &Arc<Self>,
     app: &AppHandle,
     payload: crate::sync_bundle::SyncBundlePayload,
+    include_proxy: bool,
   ) -> Result<ImportSyncBundleResponse, String> {
     let mut added_accounts = 0usize;
     let mut updated_accounts = 0usize;
@@ -6362,7 +6421,7 @@ impl SessionManager {
         }) {
           continue;
         }
-        let proxy_valid = if platform::SUPPORTS_ACCOUNT_PROXY {
+        let proxy_valid = if include_proxy && platform::SUPPORTS_ACCOUNT_PROXY {
           incoming
             .proxy_url
             .as_deref()
@@ -6388,7 +6447,7 @@ impl SessionManager {
           {
             existing.created_at_ms = incoming.created_at_ms;
           }
-          if platform::SUPPORTS_ACCOUNT_PROXY && proxy_valid.is_some() {
+          if include_proxy && platform::SUPPORTS_ACCOUNT_PROXY && proxy_valid.is_some() {
             existing.proxy_url = proxy_valid;
           }
           if tz_valid.is_some() {
@@ -6400,7 +6459,11 @@ impl SessionManager {
           updated_accounts += 1;
         } else {
           let mut rec = incoming;
-          rec.proxy_url = proxy_valid;
+          rec.proxy_url = if include_proxy && platform::SUPPORTS_ACCOUNT_PROXY {
+            proxy_valid
+          } else {
+            None
+          };
           rec.timezone = tz_valid;
           rec.auth_state = AuthState::Unknown;
           rec.cookie_expires_at_ms = None;
@@ -6585,8 +6648,12 @@ impl SessionManager {
     &self,
     app: &AppHandle,
     passphrase: String,
+    include_proxy: bool,
+    account_keys: Option<Vec<String>>,
   ) -> Result<crate::sync_bundle::ExportSyncBundleResponse, String> {
-    let (payload, cookie_account_count) = self.build_sync_bundle_payload(app).await?;
+    let (payload, cookie_account_count) = self
+      .build_sync_bundle_payload(app, include_proxy, account_keys.as_deref())
+      .await?;
     let account_count = payload.accounts.len();
     let bundle_json = crate::sync_bundle::encrypt_sync_bundle(&payload, &passphrase)?;
     let filename = format!("account-manager-sync-{}.maam", now_ms() / 1000);
@@ -6633,15 +6700,18 @@ impl SessionManager {
     app: &AppHandle,
     bundle_json: String,
     passphrase: String,
+    include_proxy: bool,
   ) -> Result<ImportSyncBundleResponse, String> {
     let payload = crate::sync_bundle::decrypt_sync_bundle(&bundle_json, &passphrase)?;
-    self.apply_sync_bundle(app, payload).await
+    self.apply_sync_bundle(app, payload, include_proxy).await
   }
 
   pub async fn start_lan_sync_share(
     &self,
     app: &AppHandle,
     passphrase: Option<String>,
+    include_proxy: bool,
+    account_keys: Option<Vec<String>>,
   ) -> Result<crate::sync_bundle::LanSyncShareInfo, String> {
     let _ = self.stop_lan_sync_share(app).await;
 
@@ -6650,7 +6720,9 @@ impl SessionManager {
       None => crate::sync_bundle::generate_lan_pin(),
     };
 
-    let (payload, cookie_account_count) = self.build_sync_bundle_payload(app).await?;
+    let (payload, cookie_account_count) = self
+      .build_sync_bundle_payload(app, include_proxy, account_keys.as_deref())
+      .await?;
     let account_count = payload.accounts.len();
     let encrypted = crate::sync_bundle::encrypt_sync_bundle(&payload, &pass)?;
     let started = crate::sync_bundle::spawn_lan_sync_server(encrypted, pass.clone(), 3, 180).await?;
@@ -6681,12 +6753,16 @@ impl SessionManager {
     &self,
     app: &AppHandle,
     relay_url: Option<String>,
+    include_proxy: bool,
+    account_keys: Option<Vec<String>>,
   ) -> Result<crate::sync_bundle::LanSyncShareInfo, String> {
     let _ = self.stop_lan_sync_share(app).await;
 
     let base_url =
       crate::sync_bundle::normalize_relay_base_url(relay_url.as_deref().unwrap_or(""))?;
-    let (payload, cookie_account_count) = self.build_sync_bundle_payload(app).await?;
+    let (payload, cookie_account_count) = self
+      .build_sync_bundle_payload(app, include_proxy, account_keys.as_deref())
+      .await?;
     let account_count = payload.accounts.len();
     let prepared = crate::sync_bundle::prepare_relay_drop(&payload, &base_url, 3, 180)?;
     crate::sync_bundle::upload_relay_drop(app, &base_url, prepared.upload_json).await?;
@@ -6738,17 +6814,18 @@ impl SessionManager {
     app: &AppHandle,
     address: String,
     passphrase: String,
+    include_proxy: bool,
   ) -> Result<ImportSyncBundleResponse, String> {
     if crate::sync_bundle::is_relay_sync_uri(&address) {
       let target = crate::sync_bundle::parse_relay_target(&address, &passphrase)?;
       let resp = crate::sync_bundle::fetch_relay_drop(app, &target).await?;
       let payload = crate::sync_bundle::decrypt_relay_drop(&resp, &target.key)?;
-      return self.apply_sync_bundle(app, payload).await;
+      return self.apply_sync_bundle(app, payload, include_proxy).await;
     }
     let (ip, port, pass) = crate::sync_bundle::parse_lan_target(&address, &passphrase)?;
     let encrypted = crate::sync_bundle::fetch_lan_sync_bundle(ip, port, &pass).await?;
     let payload = crate::sync_bundle::decrypt_sync_bundle(&encrypted, &pass)?;
-    self.apply_sync_bundle(app, payload).await
+    self.apply_sync_bundle(app, payload, include_proxy).await
   }
 
   pub async fn scan_sync_qr_code(&self, app: &AppHandle) -> Result<ScanQrResult, String> {
@@ -6765,6 +6842,126 @@ impl SessionManager {
       let _ = app;
       Err("桌面端请使用加密备份文件或输入局域网同步地址".to_string())
     }
+  }
+
+  async fn persist_webdav_config(
+    &self,
+    app: &AppHandle,
+    url: &str,
+    username: &str,
+    password: &str,
+    filename: Option<&str>,
+  ) -> Result<(), String> {
+    let clean_file = filename
+      .map(str::trim)
+      .filter(|s| !s.is_empty())
+      .unwrap_or("maam-sync.maam")
+      .to_string();
+    let snap = {
+      let mut locked = self.inner.lock().await;
+      let previous = locked.store.settings.webdav.clone();
+      locked.store.settings.webdav = crate::storage::WebDavConfig {
+        url: url.trim().to_string(),
+        username: username.trim().to_string(),
+        password: password.to_string(),
+        filename: clean_file,
+      };
+      if let Err(err) = save_store_atomic(&locked.store_path, &locked.store) {
+        locked.store.settings.webdav = previous;
+        return Err(err);
+      }
+      Self::snapshot_from_locked(&locked)
+    };
+    self.emit_snapshot(app, &snap);
+    Ok(())
+  }
+
+  pub async fn test_webdav_sync(
+    &self,
+    app: &AppHandle,
+    url: String,
+    username: String,
+    password: String,
+    filename: Option<String>,
+  ) -> Result<crate::sync_bundle::WebDavTestResult, String> {
+    let res = crate::sync_bundle::test_webdav_connection(
+      app,
+      &url,
+      &username,
+      &password,
+      filename.as_deref(),
+    )
+    .await?;
+    let _ = self
+      .persist_webdav_config(app, &url, &username, &password, filename.as_deref())
+      .await;
+    Ok(res)
+  }
+
+  pub async fn push_webdav_sync(
+    &self,
+    app: &AppHandle,
+    url: String,
+    username: String,
+    password: String,
+    filename: Option<String>,
+    passphrase: String,
+    include_proxy: bool,
+    account_keys: Option<Vec<String>>,
+  ) -> Result<crate::sync_bundle::WebDavPushResult, String> {
+    let _ = crate::sync_bundle::normalize_webdav_target(&url, filename.as_deref())?;
+    let _ = crate::sync_bundle::validate_sync_passphrase(&passphrase)?;
+    let (payload, cookie_account_count) = self
+      .build_sync_bundle_payload(app, include_proxy, account_keys.as_deref())
+      .await?;
+    let account_count = payload.accounts.len();
+    let encrypted = crate::sync_bundle::encrypt_sync_bundle(&payload, &passphrase)?;
+    let size_bytes = encrypted.len();
+    let remote_url = crate::sync_bundle::upload_webdav_bundle(
+      app,
+      &url,
+      &username,
+      &password,
+      filename.as_deref(),
+      encrypted,
+    )
+    .await?;
+    let _ = self
+      .persist_webdav_config(app, &url, &username, &password, filename.as_deref())
+      .await;
+    Ok(crate::sync_bundle::WebDavPushResult {
+      remote_url,
+      account_count,
+      cookie_account_count,
+      size_bytes,
+    })
+  }
+
+  pub async fn pull_webdav_sync(
+    self: &Arc<Self>,
+    app: &AppHandle,
+    url: String,
+    username: String,
+    password: String,
+    filename: Option<String>,
+    passphrase: String,
+    include_proxy: bool,
+  ) -> Result<ImportSyncBundleResponse, String> {
+    let _ = crate::sync_bundle::normalize_webdav_target(&url, filename.as_deref())?;
+    let _ = crate::sync_bundle::validate_sync_passphrase(&passphrase)?;
+    let encrypted = crate::sync_bundle::download_webdav_bundle(
+      app,
+      &url,
+      &username,
+      &password,
+      filename.as_deref(),
+    )
+    .await?;
+    let payload = crate::sync_bundle::decrypt_sync_bundle(&encrypted, &passphrase)?;
+    let _ = self
+      .persist_webdav_config(app, &url, &username, &password, filename.as_deref())
+      .await;
+    self.apply_sync_bundle(app, payload, include_proxy).await
   }
 
   pub async fn set_modal_active(
@@ -6987,8 +7184,16 @@ impl SessionManager {
                   .refresh_account_cookie_expiry(&app_handle, key, force || just_authenticated)
                   .await;
               } else if probe.logged_out {
+                let was_auth = {
+                  let locked = mgr.inner.lock().await;
+                  locked.store.accounts.iter().any(|a| {
+                    a.provider_id == key.provider_id
+                      && a.uuid == key.uuid
+                      && a.auth_state == AuthState::Authenticated
+                  })
+                };
                 mgr.apply_logged_out_state(&app_handle, key.clone(), vid).await;
-                if probe.stale_session {
+                if probe.stale_session && was_auth && probe.typed.is_empty() {
                   if key.provider_id.is_muse() {
                     if let Ok(u) = Url::parse("https://muse.ai/api/logout") {
                       let _ = wv.navigate(u);
@@ -7555,7 +7760,7 @@ impl SessionManager {
           false
         }
         NavigationDecision::Deny => {
-          open_external_link_once(url.as_str());
+          open_external_link_once(url);
           false
         }
       }
@@ -7566,16 +7771,8 @@ impl SessionManager {
       {
         return tauri::webview::NewWindowResponse::Deny;
       }
+      let url = unwrap_link_shim(&url).unwrap_or_else(|| url.clone());
       let decision = classify_top_level_url(&spec_for_popup, &url, true);
-      if let Some(target) = unwrap_link_shim(&url) {
-        if matches!(
-          classify_top_level_url(&spec_for_popup, &target, true),
-          NavigationDecision::Deny
-        ) {
-          open_external_link_once(target.as_str());
-          return tauri::webview::NewWindowResponse::Deny;
-        }
-      }
       match decision {
         NavigationDecision::ExternalGoogleOAuth => {
           let mgr_ext = Arc::clone(&mgr_for_popup);
@@ -7589,7 +7786,7 @@ impl SessionManager {
           return tauri::webview::NewWindowResponse::Deny;
         }
         NavigationDecision::Deny => {
-          open_external_link_once(url.as_str());
+          open_external_link_once(&url);
           return tauri::webview::NewWindowResponse::Deny;
         }
         NavigationDecision::AllowBlank | NavigationDecision::AllowHttps => {}
@@ -7668,7 +7865,7 @@ impl SessionManager {
             false
           }
           NavigationDecision::Deny => {
-            open_external_link_once(nav_url.as_str());
+            open_external_link_once(nav_url);
             if let Some(pw) = app_popup_nav.get_webview_window(&popup_label_for_close) {
               let _ = pw.close();
             }
@@ -9219,6 +9416,7 @@ impl SessionManager {
       let mut consecutive_logged_out: u8 = 0;
       let mut consecutive_page_error: u8 = 0;
       let mut stale_session_reset_done = false;
+      let mut has_confirmed_auth = false;
       let mut meta_center_probed = false;
       let mut next_delay_ms: Option<u64> = None;
       loop {
@@ -9314,7 +9512,7 @@ impl SessionManager {
           if let Some(entry) = locked.warm_pool.get_mut(&key) {
             if entry.view_instance_id == view_instance_id {
               if !probe.typed.is_empty() {
-                entry.captured_identity_hint = Some(probe.typed);
+                entry.captured_identity_hint = Some(probe.typed.clone());
               }
               if probe.is_auth {
                 let strong = if !probe.email.is_empty() {
@@ -9348,6 +9546,7 @@ impl SessionManager {
         };
 
         if probe.is_auth {
+          has_confirmed_auth = true;
           consecutive_auth_ticks = consecutive_auth_ticks.saturating_add(1);
           consecutive_logged_out = 0;
           consecutive_page_error = 0;
@@ -9413,7 +9612,11 @@ impl SessionManager {
             mgr
               .apply_logged_out_state(&app, key.clone(), view_instance_id)
               .await;
-            if probe.stale_session && !stale_session_reset_done {
+            if probe.stale_session
+              && !stale_session_reset_done
+              && has_confirmed_auth
+              && probe.typed.is_empty()
+            {
               stale_session_reset_done = true;
               if key.provider_id.is_muse() {
                 if let Ok(u) = Url::parse("https://muse.ai/api/logout") {
@@ -9425,6 +9628,7 @@ impl SessionManager {
                 }
               }
             }
+            has_confirmed_auth = false;
             next_delay_ms = Some(if tick_count < 6 { 950 } else { 6500 });
           } else {
             next_delay_ms = Some(300);

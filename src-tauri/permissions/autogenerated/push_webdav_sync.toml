@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-push-webdav-sync"
+description = "Enables the push_webdav_sync command without any pre-configured scope."
+commands.allow = ["push_webdav_sync"]
+
+[[permission]]
+identifier = "deny-push-webdav-sync"
+description = "Denies the push_webdav_sync command without any pre-configured scope."
+commands.deny = ["push_webdav_sync"]
